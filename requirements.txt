@@ -1,0 +1,9 @@
+# TRILogos — dipendenze essenziali
+requests>=2.31
+pypdf>=4.0
+
+# Opzionali (migliorano l'estrazione PDF):
+# PyMuPDF>=1.24
+
+# Per i modelli locali: installa Ollama (https://ollama.com) e scarica un modello:
+#   ollama pull qwen2.5:3b

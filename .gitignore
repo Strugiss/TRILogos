@@ -1,0 +1,8 @@
+# TRILogos — file esclusi dalla distribuzione
+__pycache__/
+*.pyc
+sessioni/*
+dev/
+profili_n47lab.json
+clienti.json
+timeline.json
