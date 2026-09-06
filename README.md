@@ -1,95 +1,96 @@
-# TRILogos — three-voice dialogue (user · LLM · LLM2)
+# TRILogos — three-voice dialogue with verified answers
 
-TRILogos is a local orchestrator that lets **two LLMs collaborate through prompts**
-under the supervision of a human. Flow: the user asks **LLM**, which formulates the
-request for **LLM2**; a reciprocal debate follows; the two analyze each other and
-split the work; finally the channel produces a **unanimous answer** (LLM proposes,
-LLM2 approves or revises) verified by a **cross-check** against the context.
+TRILogos is a local orchestrator that lets **three LLMs collaborate through prompts**
+under the supervision of a human. The third voice is the **verifier "child"**: it
+presumes every claim is wrong until proven, checks facts, signs and values, and
+returns a structured verdict (`CONFERMATA` / `DA_CORREGGERE` / `NON_CONCLUSO`).
+
+Flow (6 steps): the user asks **A** (LLM1), which analyzes and formulates the
+request; **A**, **B** and **C** debate (C verifies every turn); the channel produces
+the synthesis; a **unanimous answer** is approved by B+C; finally **C runs the
+cross-check** against the available context and returns the verdict.
 
 **Local or cloud**: works in full autonomy with local models (Ollama, LM Studio,
-Jan, llama.cpp — no network, no keys), or through existing clients (read from the
-opencode configuration, or added by you). Keys are never stored: only environment
-variable names are referenced.
+Jan — no network; Jan needs a placeholder API key, any string, set in the app's
+Local API Server), or through existing clients (opencode, OpenAI, Anthropic, or
+added by you). Keys are never stored: only environment variable names are
+referenced (BYOK).
 
-## Features
-- **Three-voice pipeline**: user → LLM → LLM2 → debate → reciprocal analysis →
-  task split → unanimous answer (consensual) → cross-check.
-- **7 languages** (IT · EN · FR · ES · DE · PT · 中文): UI and model responses switch live.
-- **Model dropdowns** per panel (LLM / LLM2 independent), models auto-discovered
-  from Ollama + opencode config + your custom clients (⚙ Options window).
-- **Attachments**: 📁 folder (up to 40 supported files) or ＋ ADD single files —
-  text, PDF (text extracted), images (sent to multimodal models).
-- **Streaming**: responses appear token by token.
-- **Cross-check (anti-hallucination)**: LLM2 verifies every claim of the unanimous
-  answer against the attached context (or the system roles), checking signs and
-  values, with verdict: CONFIRMED or NEEDS CORRECTION.
-- **Turn/call cap**: configurable (default 40 calls) — no budget surprises.
-- **Session export**: JSON + readable Markdown.
-- **Timeline integration**: every saved session becomes a typed event (T0, T1, …)
-  in `timeline.json`, compatible with the research-timeline schema (metrics,
-  evidence, ai_role) — the channel's work enters the same auditable trail as the lab.
-- **Shared GUI profile**: built on LabGUI (`.opencode/shared/LabGUI`), reusable by
-  future projects.
+## Screenshot
+_Screenshot coming soon._
 
-## Quick start
+## Requirements
+- Python 3.9+
+- `requests>=2.34`
+- `pypdf>=4.0` (**required** — PDF attachment extraction)
+- `pymupdf` (optional — improved extraction for harder PDFs)
+- Ollama for local models (optional but recommended): `winget install Ollama.Ollama`
+  or https://ollama.com/download — then `ollama pull qwen2.5:3b`
+
+## Installation
 ```bash
+git clone <your-repo-url> TRILogos
 cd TRILogos
+pip install -r requirements.txt
 python gui.py          # GUI
 python cli.py          # CLI test (mock, no keys)
-python cli.py --a ollama --b ollama --modello-a deepseek-r1:14b --modello-b deepseek-r1:14b
 ```
-- Ensure an Ollama server is running with your models (`ollama list`).
-- First load of a large model takes 1–2 minutes; then each answer streams.
-- For fast testing use a small model (e.g. `ollama pull qwen2.5:3b`) and select it
-  from the dropdowns.
-- On Windows, double-click `AvviaTRILogos.bat` (or `python gui.py`).
+On Windows you can also double-click `AvviaTRILogos.bat`.
 
-## Structure
-```
-TRILogos/
-├── gui.py            GUI (LabGUI profile)
-├── cli.py            CLI for tests
-├── config.json       roles (project context), models, language, caps
-├── clienti.json      your custom clients (never keys: only env names)
-├── timeline.json     session events (research-timeline schema)
-├── core/
-│   ├── canale.py     the three-voice pipeline
-│   ├── modelli.py    adapters: Ollama · OpenAI · Anthropic · OpenAI-compatible · Mock
-│   ├── clienti.py    client discovery (opencode config, local, custom)
-│   └── timeline.py   research-timeline integration
-└── sessioni/         saved sessions (JSON + MD)
-```
+## Configuration
+- **Splash "Pronto all'uso"**: on startup TRILogos detects your local clients and
+  shows their installation status (not installed → installer instructions + winget;
+  installed but stopped → start it; active → models). The "✓ Primi passi" checklist
+  auto-updates its four ticks (install Ollama / pull a model / connect the voices /
+  ask your first question). The key input stays visible, plus a **Disconnetti**
+  button and a "🔄 Riprova connessioni" re-test.
+- **BYOK**: cloud keys live in `.env` (gitignored), never in clear; custom clients
+  can use a real key or `env:NAME`.
+- **Clients**: 6 defaults (opencode, ollama, lmstudio, jan, openai, anthropic);
+  add your own with the "➕ Aggiungi un client personalizzato" form
+  (name / base URL / key / models). opencode is listed and read from its own config.
 
-## Scientific basis
-Multi-agent debate improves answer quality (Du et al. 2023, *Improving Factuality
-and Reasoning through Multiagent Debate*; NeurIPS 2024 framework analyses; ICLR
-2025 benchmark reviews). Key lesson applied: diversity matters — LLM and LLM2 play
-different roles and can be different models.
+## Usage
+Flow (6 steps):
+1. **A analyzes**: the first voice (LLM1) receives your question, analyzes it and
+   formulates the request for B.
+2. **A/B/C debate**: the three voices exchange positions (C verifies every turn)
+   until convergence — or **early-exit** if they already agree from the start.
+3. **Synthesis**: the channel summarizes and splits the work (who does what).
+4. **Unanimous answer**: one shared answer, approved by **B+C**.
+5. **C cross-check**: the verifier checks every claim against the context
+   (attachments or system roles), marks `[SUPPORTATO]`/`[NON SUPPORTATO]`, and
+   returns the verdict.
+6. **Verdict**: `CONFERMATA` / `DA_CORREGGERE` / `NON_CONCLUSO` with deterministic
+   metrics.
 
-## Feedback & testing — we need YOU
-TRILogos is young and we want it to grow with real users. **Your feedback is
-essential** — please test it and tell us what works, what breaks, and what you'd
-add.
+If the verdict is `DA_CORREGGERE`, press **✏️ Correggi** (user action, never
+automatic, max 3 reruns; each rerun re-runs the cross-check). If the debate does
+not converge, the final answer is marked `[NON-CONSENSO]` and preserves both
+positions.
 
-- **Test checklist**: see `CHECKLIST_TEST_EN.md` (and `CHECKLIST_TEST.md` in Italian)
-- **How to give feedback**: open an issue on this repository with:
-  - what you tried (checklist item number),
-  - what happened (✓ worked / ✗ problem, with the message you saw),
-  - any suggestion (UX, features, languages, aesthetics).
-- We are especially interested in: new languages, model compatibility, attachment
-  formats, debate quality, and anything that feels awkward.
+## Features
+- **✏️ Correggi**: re-queues the answer with the verifier's points (max 3 reruns).
+- **Verdict**: three outcomes (`CONFERMATA` / `DA_CORREGGERE` / `NON_CONCLUSO`).
+- **Early-exit debate**: if the voices agree immediately, the debate is skipped.
+- **7 languages** (IT · EN · FR · ES · DE · PT · 中文): UI and model responses switch live.
+- **Attachments**: text, PDF (pypdf required; pymupdf optional), images, folders —
+  up to 40 files.
+- **Sessions**: export JSON + readable Markdown, plus a typed timeline
+  (research-timeline schema: metrics, evidence, ai_role).
+- **Profiles** (👥): role presets for the voices in `config.json`.
+- **Step temperatures** (research-backed 2026): formulation 0.7, debate 0.7,
+  synthesis 0.4, unanimous 0.4, revision 0.3, verification 0.2 — with per-voice
+  convergence thresholds A=0.2 / B=0.5 / C=0.87.
+- **Cap**: 60 calls per session (configurable in config.json → canale → max_chiamate).
+- **Stopwatch** in the SUPERVISORE pill; live token in/out and call counter in the
+  status bar.
 
-Every report makes the tool better — thank you!
+## Version
+Current version: **2.0.0** (TRIVOICE: three voices). See the
+[CHANGELOG](CHANGELOG.md) for the full history.
 
-## Licenses & third-party services
-- TRILogos is released under the MIT License (see LICENSE).
-- All code and documentation are original; the multi-agent debate concept is
-  published scientific literature (cited above), and this implementation is
-  independent.
-- Models are provided by third-party services (Ollama, OpenAI, Anthropic, or any
-  OpenAI-compatible client you configure): their use is subject to their own
-  terms and licenses. TRILogos is a client: it does not redistribute models or
-  any third-party content. API keys are never stored — only environment variable
-  names are referenced.
+## License
+MIT — see [LICENSE](LICENSE).
 
 TRILogos — N47Lab, 2026.

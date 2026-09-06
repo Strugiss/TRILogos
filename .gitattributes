@@ -1,0 +1,6 @@
+# TRILogos — normalizzazione newline (tutti i file di testo in CRLF, coerente con Windows)
+* text=auto eol=crlf
+*.md text eol=crlf
+*.py text eol=crlf
+*.json text eol=crlf
+*.bat text eol=crlf

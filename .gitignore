@@ -1,4 +1,6 @@
 # TRILogos — file esclusi dalla distribuzione
+.env
+.env.*
 __pycache__/
 *.pyc
 sessioni/*
@@ -6,3 +8,12 @@ dev/
 profili_n47lab.json
 clienti.json
 timeline.json
+log_gui.txt
+*.log
+Backup/
+icona_trilogos.jpg
+
+# Artefatti packaging
+dist/
+build/
+*.egg-info/

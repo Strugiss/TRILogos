@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trilogos"
+version = "2.0.0"
+description = "TRILogos — three-voice dialogue with verified answers, local-first"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.9"
+dependencies = [
+    "requests>=2.34",
+    "pypdf>=4.0",
+    "pymupdf>=1.24",
+]
+authors = [
+    { name = "N47Lab" },
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "Environment :: Win32 (MS Windows)",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.scripts]
+trilogos-cli = "cli:main"
+
+[project.urls]
+Repository = "https://github.com/Strugiss/TRILogos.git"
+
+[tool.setuptools]
+py-modules = ["cli", "gui", "rounded"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*", "LabGUI*"]
+namespaces = true

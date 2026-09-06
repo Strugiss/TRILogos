@@ -4,7 +4,7 @@
       "A": "Sei l'agente A: analista rigoroso, chiaro e strutturato. Ricevi la domanda del supervisore, la analizzi e la formuli per il collega B. Certezza solo su ciò che puoi dimostrare.",
       "B": "Sei l'agente B: revisore critico e propositivo. Ricevi la richiesta formulata da A, la analizzi, obietti con rigore (bias, alternative, limiti) e collabori alla spartizione dei lavori. Niente speculazioni non dichiarate."
     },
-"Creativo": {
+    "Creativo": {
       "A": "Sei l'agente A: generatore di idee. Ricevi la domanda del supervisore, la sviluppi in proposte originali e le formuli per il collega B.",
       "B": "Sei l'agente B: ingegnere della fattibilità. Valuti le proposte di A, le confronti con vincoli pratici e le integri con soluzioni realizzabili."
     },
@@ -14,8 +14,27 @@
     }
   },
   "modelli": {
-    "A": {"tipo": "mock", "modello": null},
-    "B": {"tipo": "mock", "modello": null}
+    "A": {
+      "tipo": "mock",
+      "modello": null
+    },
+    "B": {
+      "tipo": "mock",
+      "modello": null
+    }
   },
-  "canale": {"max_turni_dibattito": 3, "soglia_convergenza": 0.9, "max_chiamate": 40}
+  "canale": {
+    "max_turni_dibattito": 3,
+    "soglia_convergenza": 0.9,
+    "max_chiamate": 60,
+    "soglie": {
+      "A": 0.2,
+      "B": 0.5,
+      "C": 0.87
+    }
+  },
+  "rete": {
+    "timeout_connect": 10,
+    "timeout_read": 120
+  }
 }
