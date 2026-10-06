@@ -1,7 +1,7 @@
 # TRILogos — three-voice dialogue with verified answers
 
 [![Licenza: MIT](https://img.shields.io/badge/licenza-MIT-brightgreen?style=flat-square)](LICENSE)
-[![Versione](https://img.shields.io/badge/versione-3.0.0-f0b429?style=flat-square)](https://github.com/Strugiss/TRILogos/releases)
+[![Versione](https://img.shields.io/badge/versione-3.1.0-f0b429?style=flat-square)](https://github.com/Strugiss/TRILogos/releases)
 [![Test](https://img.shields.io/badge/test-PASS-brightgreen?style=flat-square)]()
 [![Piattaforma](https://img.shields.io/badge/Windows-10%2F11-0078D6?style=flat-square&logo=windows&logoColor=white)]()
 [![BYOK](https://img.shields.io/badge/BYOK-local%20%2F%20cloud-8957e5?style=flat-square)]()
@@ -137,7 +137,7 @@ spot, equivalent to Esc); it goes back to Svuota when the flow ends.
   status bar.
 
 ## Version
-Current version: **3.0.0** (ARCA Engine). See the
+Current version: **3.1.0** (ARCA Engine). See the
 [CHANGELOG](CHANGELOG.md) for the full history.
 
 ## Links

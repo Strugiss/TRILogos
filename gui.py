@@ -58,6 +58,7 @@ try:
     from core import downloader as _downloader
     from core import profiler as _profiler
     from core import pulizia as _pulizia
+    from core.metro import MisuratoreTok
 except ImportError as e:
     _errore_import(e)
 
@@ -143,7 +144,7 @@ def modello_da_voce(voce, clienti=None, timeout=None, keep_alive=None, num_ctx=N
     return _modello_da_voce_core(voce, clienti, timeout=timeout,
                                  keep_alive=keep_alive, num_ctx=num_ctx)
 
-VERSIONE = "3.0.0"
+VERSIONE = "3.1.0"
 
 def _supporta(fn, nome_param):
     """True se la funzione/metodo accetta il parametro (API Canale estesa, fase 2)."""
@@ -2144,6 +2145,10 @@ class FinestraAgenti(tk.Toplevel):
             self._scrivi(self._aree["Log"], f"salvato: {dati.get('percorso', '')}")
 
 
+# A13 — contatore tok/s: intervallo di refresh (2 Hz, un solo after pendente).
+_TOK_INTERVALLO = 0.5
+
+
 class TrilogoApp(Finestra):
     def __init__(self):
         # Finestra 1200×862: +142px in altezza per la zona C doppia (284px).
@@ -2188,6 +2193,18 @@ class TrilogoApp(Finestra):
         self._stato_testo = ""
         self._stato_colore = PALETTE["secondario"]
         self._crono = {"passo": None, "durata": None, "totale": None}
+        # A13: contatore tok/s (modulo puro core\metro.py; la UI è toccata solo
+        # sul main thread, il worker alimenta il metro via _flusso).
+        self._metro = MisuratoreTok()
+        self._tok_lock = threading.Lock()
+        self._tok_after_id = None        # id dell'after di refresh pendente
+        self._tok_after_pendente = False
+        self._tok_ultimo_refresh = 0.0
+        self._tok_fine_passo = False     # True tra fine passo e il successivo
+        self._tok_out0 = 0               # token out a inizio passo (delta usage)
+        # A13 rev. 17.1: base congelata del totale di sessione Σ (in+out reali
+        # catturati a inizio passo; la stima del passo in corso si somma sopra).
+        self._tok_sigma_base = 0
         self._costruisci()
         if _avviso_timeout:
             self.stato(_avviso_timeout)
@@ -2264,6 +2281,9 @@ class TrilogoApp(Finestra):
         tk non è thread-safe."""
         crono = self._componi_crono()
         testo = f"{self._stato_testo}  ·  {crono}" if self._stato_testo else crono
+        tok = self._componi_tok()
+        if tok:
+            testo += f"  ·  {tok}"
         try:
             self._status.configure(text=testo, fg=self._stato_colore)
         except tk.TclError:
@@ -2453,6 +2473,8 @@ class TrilogoApp(Finestra):
             return False
         self.canale.annulla = False
         self._busy = True
+        # A13: nuovo flusso -> metro azzerato, segmento tok/s da '⚡ …'
+        self._tok_reset()
         for chiave in self.bottoni:
             # B3 rev. (N47): "agenti" resta attivo durante la ricerca: il
             # pannello serve proprio mentre gli agenti lavorano.
@@ -2477,6 +2499,8 @@ class TrilogoApp(Finestra):
         except Exception:
             pass
         self._busy = False
+        # A13: fine lavoro (o annullo) -> il segmento tok/s sparisce.
+        self._tok_reset()
         for chiave in self.bottoni:
             self.bottoni[chiave].configure(state="normal")
         # A12: il pulsante contestuale torna "Svuota" (testo e comando originali)
@@ -2517,6 +2541,11 @@ class TrilogoApp(Finestra):
         self.supervisore.bind("<Return>", self._invio_supervisore)
         self.supervisore.bind("<FocusIn>", self._focus_supervisore)
         self.supervisore.bind("<FocusOut>", self._blur_supervisore)
+        # N47 06/10/2026 (fix Svuota): al primo tasto o incolla il placeholder
+        # sparisce PRIMA dell'inserimento (il binding del widget precede quello
+        # di classe): la nuova domanda non si mescola mai al placeholder.
+        self.supervisore.bind("<KeyPress>", self._primotasto_supervisore)
+        self.supervisore.bind("<<Paste>>", self._primotasto_supervisore)
         self._metti_placeholder()
 
         # ZONA B — riga dei 4 riquadri (420px): GRID a 6 colonne (weight 0,1,1,1)
@@ -2848,6 +2877,17 @@ class TrilogoApp(Finestra):
         if self._e_placeholder():
             self.supervisore.delete("1.0", "end")
 
+    def _primotasto_supervisore(self, e=None):
+        """Fix N47 06/10/2026: prima digitazione (o incolla) col placeholder
+        visibile -> il placeholder viene cancellato PRIMA che il testo venga
+        inserito. Serve quando il FocusIn non scatta (il campo ha già il focus
+        del sistema, es. dopo Svuota o dopo un flusso): senza, il testo si
+        mescolava al placeholder e la domanda partiva corrotta. Ritorna None:
+        il binding di classe Text prosegue con l'inserimento del carattere."""
+        if self._e_placeholder():
+            self.supervisore.delete("1.0", "end")
+        return None
+
     def _blur_supervisore(self, e=None):
         if not self.supervisore.get("1.0", "end").strip():
             self._metti_placeholder()
@@ -2937,8 +2977,6 @@ class TrilogoApp(Finestra):
         if lenti:
             for n, colonna in lenti:
                 colonna.scrivi(f"⚠ modello lento su CPU: attesa stimata 2-5 min per risposta ({n})")
-            nomi = ", ".join(n for n, _ in lenti)
-            self.stato(f"⚠ modello lento su CPU: attesa stimata 2-5 min per risposta ({nomi})")
         self._ultima_domanda = domanda
         self._supervisore_appendi("▶ " + " ".join(domanda.split()))
         if getattr(self, "_profilo_attivo", "") == "Ricerca":
@@ -3023,6 +3061,159 @@ class TrilogoApp(Finestra):
         finale resta visibile (nessun reset qui)."""
         self._crono = {"passo": passo, "durata": durata, "totale": totale}
         self._disegna_cronometro()
+
+    # ---- A13: contatore tok/s in tempo reale (status bar composta) ----
+    def _componi_tok(self):
+        """Segmento '⚡ <n> tok/s' della status bar (solo durante l'elaborazione;
+        a riposo il segmento non compare). Formato italiano con virgola; '⚡ …'
+        prima del primo chunk; '0,0' a finestra vuota; '≈' davanti alla media
+        stimata (senza usage reale). In coda il totale di sessione Σ (A13
+        rev. 17.1) se > 0: '⚡ 42,3 tok/s · Σ 12.345'."""
+        if not self._busy:
+            return ""
+        if self._tok_fine_passo:
+            valore = self._metro.media()
+            if valore is None:
+                segmento = "⚡ …"
+            else:
+                prefisso = "" if self._metro.media_reale() else "≈"
+                segmento = f"⚡ {prefisso}{self._num_it(valore)} tok/s"
+        else:
+            istantaneo = self._metro.tok_s()
+            if istantaneo is None:
+                segmento = "⚡ …"
+            else:
+                segmento = f"⚡ {self._num_it(istantaneo)} tok/s"
+        sigma = self._componi_sigma()
+        return f"{segmento} · Σ {sigma}" if sigma else segmento
+
+    @staticmethod
+    def _num_it(valore):
+        """1 decimale, virgola italiana (stile A13, come il cronometro)."""
+        return f"{valore:.1f}".replace(".", ",")
+
+    @staticmethod
+    def _num_migliaia(valore):
+        """Intero con separatore migliaia italiano (punto), senza `locale` di
+        sistema (A13 rev. 17.1): 12345 -> '12.345'."""
+        return f"{int(round(valore)):,}".replace(",", ".")
+
+    def _token_reali(self):
+        """Reali in+out accumulati da `Canale.token_totali` (A13 rev. 17.1)."""
+        tok = self.canale.token_totali
+        return tok.get("in", 0) + tok.get("out", 0)
+
+    def _componi_sigma(self):
+        """Σ di sessione (A13 rev. 17.1): '' se <= 0 (segmento assente a inizio
+        flusso/riposo). Schema a base congelata: durante il passo
+        Σ = base (reali in+out) + stima del passo in corso; a passo chiuso
+        Σ = reali correnti di `token_totali` (l'usage del passo è già
+        contabilizzato dal Canale: nessun doppio conteggio)."""
+        if self._tok_fine_passo:
+            somma = self._token_reali()
+        else:
+            somma = self._tok_sigma_base + self._metro.token_stimati()
+        intero = int(round(somma))
+        if intero <= 0:
+            return ""
+        return self._num_migliaia(intero)
+
+    def _tok_alimenta(self, pezzo):
+        """A13: alimenta il metro (dal thread di streaming, O(1)) e pianifica
+        il refresh: aggiornamento immediato se sono passati >=500 ms, altrimenti
+        un singolo after(500-Delta) via coda UI. Mai un timer accumulato."""
+        if not pezzo:
+            return
+        self._metro.aggiungi(pezzo)
+        if not self._busy:
+            return
+        with self._tok_lock:
+            if self._tok_after_pendente:
+                return
+            ora = time.monotonic()
+            delta = ora - self._tok_ultimo_refresh
+            if delta >= _TOK_INTERVALLO:
+                self._tok_ultimo_refresh = ora
+                self._ui(self._aggiorna_status)
+            else:
+                self._tok_after_pendente = True
+                self._ui(self._tok_after, _TOK_INTERVALLO - delta)
+
+    def _tok_after(self, ritardo):
+        """A13 (main thread): programma il tick di refresh; un solo after vivo."""
+        if self._chiusa or self._tok_after_id is not None:
+            return
+        try:
+            self._tok_after_id = self.after(
+                max(1, int(round(ritardo * 1000))), self._tok_tick)
+        except tk.TclError:
+            pass
+
+    def _tok_tick(self):
+        """A13 (main thread): aggiorna la status; se la finestra ha ancora
+        attivita' riprogramma un tick (cosi' a finestra vuota arriva '0,0'),
+        altrimenti si ferma (il prossimo chunk riattiva il refresh)."""
+        self._tok_after_id = None
+        if self._chiusa:
+            return
+        riprogramma = False
+        if self._busy:
+            self._aggiorna_status()
+            with self._tok_lock:
+                self._tok_ultimo_refresh = time.monotonic()
+                if self._metro.attivo():
+                    riprogramma = True
+                else:
+                    self._tok_after_pendente = False
+        else:
+            with self._tok_lock:
+                self._tok_after_pendente = False
+        if riprogramma:
+            try:
+                self._tok_after_id = self.after(int(_TOK_INTERVALLO * 1000),
+                                                self._tok_tick)
+            except tk.TclError:
+                pass
+
+    def _tok_reset(self):
+        """A13: reset a inizio flusso/fine lavoro/annullamento: metro azzerato,
+        after annullato, segmento assente. Gira sul main thread."""
+        self._metro.reset()
+        self._tok_fine_passo = False
+        self._tok_out0 = self.canale.token_totali.get("out", 0)
+        # A13 rev. 17.1: la base Σ segue i reali correnti: a inizio flusso il Σ
+        # di sessione prosegue; a fine lavoro/annullo il valore resta in memoria.
+        self._tok_sigma_base = self._token_reali()
+        with self._tok_lock:
+            self._tok_ultimo_refresh = 0.0
+            self._tok_after_pendente = False
+        if self._tok_after_id is not None:
+            try:
+                self.after_cancel(self._tok_after_id)
+            except tk.TclError:
+                pass
+            self._tok_after_id = None
+
+    def _tok_inizio_passo(self):
+        """A13 (main thread, via coda UI): nuovo passo -> il segmento riparte
+        da '⚡ …' e il delta usage conta da qui."""
+        self._metro.reset()
+        self._tok_fine_passo = False
+        self._tok_out0 = self.canale.token_totali.get("out", 0)
+        self._tok_sigma_base = self._token_reali()   # A13 rev. 17.1: base Σ
+        with self._tok_lock:
+            self._tok_ultimo_refresh = 0.0
+        self._aggiorna_status()
+
+    def _tok_finalizza_passo(self, durata):
+        """A13 (main thread, via coda UI): a fine passo la media usa l'usage
+        reale (eval_count) se disponibile, altrimenti resta la stima; il
+        segmento resta visibile finche' non parte il passo successivo."""
+        delta = self.canale.token_totali.get("out", 0) - self._tok_out0
+        if delta > 0:
+            self._metro.finalizza(delta, durata)
+        self._tok_fine_passo = True
+        self._aggiorna_status()
 
     def _scrivi_errore(self, e):
         if self._chiusa:
@@ -3111,10 +3302,15 @@ class TrilogoApp(Finestra):
                 if finito:
                     durata = ora - t_passo
                     self._tempo(nome, durata, ora - t0)
+                    # A13: media del passo con l'usage reale (eval_count) se c'è
+                    self._ui(self._tok_finalizza_passo, durata)
                     t_passo = ora
                 else:
                     self._tempo(nome + " (in corso)", None, ora - t0)
+                    # A13: nuovo passo -> reset del segmento tok/s ('⚡ …')
+                    self._ui(self._tok_inizio_passo)
             self._tempo("formulazione…", 0.0, 0.0)
+            self._ui(self._tok_inizio_passo)
             self._ui(self.c_a.scrivi, t["formula"])
             contesto = self.canale.domanda_utente(domanda,
                                               on_chunk=lambda x: self._flusso(self.c_a, x),
@@ -3299,6 +3495,9 @@ class TrilogoApp(Finestra):
         di state: i box di output sono in sola lettura selezionabile permanente,
         così la selezione dell'utente non viene cancellata durante lo streaming."""
         if threading.current_thread() is not threading.main_thread():
+            # A13: il chunk è contato QUI (thread di streaming, O(1)); la
+            # scrittura tk resta sul main thread via coda UI.
+            self._tok_alimenta(pezzo)
             self._ui(self._flusso, colonna, pezzo)
             return
         colonna.box.insert("end", pezzo)
@@ -3491,10 +3690,22 @@ class TrilogoApp(Finestra):
         for c in (self.c_a, self.c_b, self.c_c, self.c_finale):
             c.box.delete("1.0", "end")
         self._metti_placeholder()
+        # N47 06/10/2026 (fix Svuota): il campo e' PRONTO per la nuova domanda.
+        # Se il focus era su un altro widget (es. la combo profilo/modello),
+        # i tasti andavano persi e la domanda non partiva piu': Svuota riporta
+        # il focus nel supervisore. Se il focus era gia' nel campo e il
+        # placeholder resta visibile, lo rimuove il primo tasto (bind KeyPress).
+        try:
+            self.supervisore.focus_set()
+        except tk.TclError:
+            pass
         self.canale.allegati = []
         self.canale.cronologia = []
         self.canale.chiamate = 0
         self.canale.token_totali = {"in": 0, "out": 0}
+        # A13 rev. 17.1: Svuota/nuova sessione azzera il totale di sessione Σ
+        # (a riposo il segmento non compare comunque: _busy e' False).
+        self._tok_sigma_base = 0
         self.ultimo_verdetto = ""
         self.ultimo_finale = ""
         self.ultimo_punti = ""

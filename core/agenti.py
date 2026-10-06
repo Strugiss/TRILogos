@@ -6,12 +6,21 @@ artefatti, mai accontentarsi di 8,98). L'output del progetto va SOLO nella
 cartella scelta dall'utente (<cartella>\\TRILogos_output\\), con nomi univoci e
 nessuna sovrascrittura (A9 rev. 5). Nessuna duplicazione del motore chiamate:
 tutto passa da `Canale.chiama` (B1b: cap, fallback, token, temperatura).
+
+A14b: in `discerni`, se `decision.abilitato` e' true e il modello decisionale
+e' disponibile (core\\decisione.py), ogni iterazione riceve in affiancamento
+una valutazione "D" (`iterazione["valutatore_d"] = {score, confidence}`). D
+informa e NON giudica: la confidenza resta `min(A,B,C)` e la soglia 8,99 non
+cambia; la `usage` D e' contata a parte (`EsitoRicerca.usage_decision`), mai
+nel Canale/Σ A13. Senza modello o su errore: nessun D, fallback silenzioso.
 """
 import json
 import os
 from dataclasses import dataclass, field
 
+from . import decisione
 from . import perimetro
+from .canale import VINCOLI_REGISTRO
 from .modelli import _estrai_json
 
 SOGLIA_DEFAULT = 8.99
@@ -55,6 +64,28 @@ SCHEMA_VALUTAZIONE = {
     "required": ["punteggio", "motivazione"],
 }
 
+# A14b: valutatore "D" di affiancamento (decision model locale /v1/systemone).
+# 11 livelli 0-10 in italiano (indice = punteggio) per il quesito "score".
+LIVELLI_D = (
+    "0 — del tutto sbagliata o fuori tema",
+    "1 — gravemente insufficiente",
+    "2 — molto scarsa, errori gravi",
+    "3 — scarsa, errori rilevanti",
+    "4 — mediocre, carenze evidenti",
+    "5 — appena sufficiente, incerta",
+    "6 — sufficiente, ma migliorabile",
+    "7 — buona, con limiti minori",
+    "8 — molto buona, corretta e completa",
+    "9 — ottima: corretta, completa e pertinente",
+    "10 — perfetta e non forzata",
+)
+ISTRUZIONI_D = (
+    "Valuta la risposta candidata rispetto al progetto/domanda del supervisore: "
+    "correttezza, completezza, pertinenza, assenza di artefatti forzati. "
+    "10 = perfetta ma non forzata; non regalare punti."
+)
+MAX_CHIAMATE_D_DEFAULT = 12
+
 
 @dataclass
 class PianoAgenti:
@@ -75,6 +106,9 @@ class EsitoRicerca:
     motivo_stop: str = "iterazioni"
     chiamate: int = 0
     token: dict = field(default_factory=dict)
+    # A14.3: contabilita' decision model SEPARATA dal Canale/Σ A13.
+    decision_chiamate: int = 0
+    usage_decision: dict = field(default_factory=lambda: {"in": 0, "out": 0})
 
     def to_dict(self):
         return {
@@ -85,6 +119,8 @@ class EsitoRicerca:
             "motivo_stop": self.motivo_stop,
             "chiamate": self.chiamate,
             "token": self.token,
+            "decision_chiamate": self.decision_chiamate,
+            "usage_decision": self.usage_decision,
         }
 
 
@@ -167,9 +203,11 @@ def _vincoli_piano(max_agenti):
         f"Da 1 a {max_agenti} agenti; scegli SOLO quelli necessari (esempi indicativi, "
         "mai un elenco chiuso: programmatore, decodificatore, calcolatore, verificatore, "
         "documentarista...). Per ogni agente: nome breve, specialita', obiettivo, "
-        "prompt_sistema (il suo ruolo/personalita' completo) e output_atteso. "
+        "prompt_sistema (descrizione operativa e professionale del suo modo di lavorare, "
+        "senza formule di auto-presentazione) e output_atteso. "
         "Se un campo manca usa esattamente \"nessuno\"/\"sconosciuto\"/\"generico\". "
-        "Rispondi SOLO con l'oggetto JSON secondo lo schema, senza altro testo."
+        "Rispondi SOLO con l'oggetto JSON secondo lo schema, senza altro testo; "
+        "non menzionare il processo e usa un registro professionale."
     )
 
 
@@ -189,7 +227,7 @@ def pianifica(canale, domanda, contesto="", cfg=None, evento=None):
 
     _evento(evento, "fase", {"nome": "pianificazione"})
     dati_a, _g = _chiama_json(canale, canale.A, [
-        {"ruolo": "system", "contenuto": canale.ruolo_a},
+        {"ruolo": "system", "contenuto": canale.ruolo_a + "\n\n" + VINCOLI_REGISTRO},
         {"ruolo": "user", "contenuto": base + "\n\n" + _vincoli_piano(max_agenti)},
     ], SCHEMA_PIANO, "ricerca_piano", tentativi=3)
     piano = _valida_piano(dati_a, max_agenti)
@@ -198,7 +236,7 @@ def pianifica(canale, domanda, contesto="", cfg=None, evento=None):
         return None
 
     dati_b, _g = _chiama_json(canale, canale.B, [
-        {"ruolo": "system", "contenuto": canale.ruolo_b},
+        {"ruolo": "system", "contenuto": canale.ruolo_b + "\n\n" + VINCOLI_REGISTRO},
         {"ruolo": "user", "contenuto": base + "\n\nPiano proposto da A (JSON):\n"
             + json.dumps(piano.to_dict(), ensure_ascii=False)
             + "\n\nObietta e integra con rigore, poi restituisci il piano MIGLIORATO "
@@ -210,7 +248,7 @@ def pianifica(canale, domanda, contesto="", cfg=None, evento=None):
 
     if canale.C is not None:
         verifica = canale.chiama(canale.C, [
-            {"ruolo": "system", "contenuto": canale.ruolo_c},
+            {"ruolo": "system", "contenuto": canale.ruolo_c + "\n\n" + VINCOLI_REGISTRO},
             {"ruolo": "user", "contenuto": base + "\n\nPiano finale (JSON):\n"
                 + json.dumps(piano.to_dict(), ensure_ascii=False)
                 + "\n\nVerifica la fattibilita' e la coerenza del piano con il progetto. "
@@ -232,7 +270,8 @@ def esegui(canale, piano, domanda, contesto="", cfg=None, evento=None):
         _evento(evento, "agente", {"indice": i, "nome": ag["nome"],
                                    "specialita": ag["specialita"], "stato": "in corso"})
         testo = canale.chiama(canale.A, [
-            {"ruolo": "system", "contenuto": ag["prompt_sistema"] or "Sei un agente specializzato."},
+            {"ruolo": "system", "contenuto": (ag["prompt_sistema"] or
+                "Assolvi il compito assegnato con rigore e chiarezza.") + "\n\n" + VINCOLI_REGISTRO},
             {"ruolo": "user", "contenuto": base
                 + f"\n\nObiettivo del tuo lavoro:\n{ag['obiettivo']}"
                 + f"\n\nOutput atteso:\n{ag['output_atteso']}"},
@@ -265,10 +304,11 @@ def _e_approvo(testo):
 def _valuta(canale, voce, modello, candidato, domanda, cfg):
     dati, _g = _chiama_json(canale, modello, [
         {"ruolo": "system", "contenuto": (
-            "Sei un valutatore severo. Assegna un punteggio 0-10 alla risposta "
+            "Valuta con severità la risposta assegnando un punteggio 0-10 "
             "rispetto a: correttezza, completezza, pertinenza al progetto, "
             "assenza di artefatti forzati. 10 = perfetta ma non forzata; "
-            "non regalare punti. Rispondi SOLO col JSON dello schema.")},
+            "non regalare punti. Rispondi SOLO col JSON dello schema, "
+            "senza menzionare il processo.")},
         {"ruolo": "user", "contenuto": (
             f"Progetto/domanda:\n{domanda}\n\nRisposta candidata:\n{candidato}")},
     ], SCHEMA_VALUTAZIONE, "ricerca_valutazione", tentativi=2)
@@ -283,12 +323,79 @@ def _valuta(canale, voce, modello, candidato, domanda, cfg):
             "motivazione": str(dati.get("motivazione") or "")[:400]}
 
 
+def _config_decision(cfg):
+    """A14c: sezione "decision" del config. Usa la cfg passata se contiene
+    "decision" (dict), altrimenti legge config.json del progetto; fallback {}
+    (decision spenti) senza mai sollevare."""
+    if isinstance(cfg, dict) and isinstance(cfg.get("decision"), dict):
+        return cfg["decision"]
+    percorso = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
+    try:
+        with open(percorso, encoding="utf-8") as f:
+            dati = json.load(f)
+        sezione = dati.get("decision")
+        return sezione if isinstance(sezione, dict) else {}
+    except Exception:
+        return {}
+
+
+def _opzioni_decision(dec):
+    """A14c: opzioni opzionali (endpoint, timeout, keep_alive, tentativi) per
+    core.decisione.valuta; assenti -> default del modulo."""
+    opzioni = {}
+    if dec.get("endpoint"):
+        opzioni["endpoint"] = str(dec["endpoint"])
+    if dec.get("timeout") is not None:
+        opzioni["timeout"] = dec["timeout"]
+    if dec.get("keep_alive") is not None:
+        opzioni["keep_alive"] = dec["keep_alive"]
+    if dec.get("tentativi") is not None:
+        opzioni["tentativi"] = dec["tentativi"]
+    return opzioni
+
+
+def _valuta_d(dec, modello_d, domanda, candidato):
+    """A14b: 1 valutazione "D" (score 0..10, 11 livelli) su domanda+candidato.
+    Ritorna RispostaDecisione con score numerico, oppure None: qualunque errore
+    e' assorbito qui (fallback silenzioso, nessuna regressione del flusso)."""
+    try:
+        state = (f"Progetto/domanda del supervisore:\n{domanda}\n\n"
+                 f"Risposta candidata:\n{candidato}")
+        risposte = decisione.valuta(
+            state,
+            [decisione.Quesito("merito", "score", ISTRUZIONI_D, list(LIVELLI_D))],
+            modello_d, **_opzioni_decision(dec))
+        r = risposte.get("merito")
+        if r is None or r.score is None:
+            return None
+        return r
+    except Exception:
+        return None
+
+
 def discerni(canale, domanda, piano, risultati, cfg=None, evento=None):
     """Discernimento: A sintetizza, B rivede; A/B/C valutano (0-10); confidenza =
     minimo delle tre voci; stop quando confidenza >= soglia - 1e-9 (default 8,99).
-    Mai forzare: se la soglia non si raggiunge, si dichiara il punteggio reale."""
+    Mai forzare: se la soglia non si raggiunge, si dichiara il punteggio reale.
+    A14b: se abilitato e disponibile, ogni iterazione riceve anche la voce "D"
+    (decision model locale) in `iterazione["valutatore_d"]`, a solo scopo di
+    affiancamento: confidenza e soglia restano quelle di A/B/C."""
     soglia = float(_cfg(cfg, "soglia_ottimo", SOGLIA_DEFAULT))
     max_it = int(_cfg(cfg, "max_iterazioni", MAX_ITERAZIONI_DEFAULT))
+    # A14b: attivazione del valutatore D (decision.abilitato + modello presente).
+    dec = _config_decision(cfg)
+    usa_d = bool(dec.get("abilitato"))
+    modello_d = str(dec.get("modello") or "").strip()
+    if usa_d and modello_d:
+        usa_d = decisione.disponibile(modello_d, endpoint=(dec.get("endpoint") or None))
+    else:
+        usa_d = False
+    try:
+        max_chiamate_d = int(dec.get("max_chiamate", MAX_CHIAMATE_D_DEFAULT))
+    except (TypeError, ValueError):
+        max_chiamate_d = MAX_CHIAMATE_D_DEFAULT
+    chiamate_d = 0
+    usage_d = {"in": 0, "out": 0}
     blocco = _blocco_risultati(risultati)
     iterazioni = []
     candidato = ""
@@ -303,7 +410,7 @@ def discerni(canale, domanda, piano, risultati, cfg=None, evento=None):
                                     for v in iterazioni[-1]["valutazioni"]))
         _evento(evento, "fase", {"nome": "discernimento", "iterazione": n})
         candidato = canale.chiama(canale.A, [
-            {"ruolo": "system", "contenuto": canale.ruolo_a},
+            {"ruolo": "system", "contenuto": canale.ruolo_a + "\n\n" + VINCOLI_REGISTRO},
             {"ruolo": "user", "contenuto": (
                 f"Progetto/domanda del supervisore:\n{domanda}\n\n"
                 f"Risultati degli agenti:\n{blocco}\n\n"
@@ -316,7 +423,7 @@ def discerni(canale, domanda, piano, risultati, cfg=None, evento=None):
                 + feedback)},
         ], passo="univoca") or ""
         revisione = canale.chiama(canale.B, [
-            {"ruolo": "system", "contenuto": canale.ruolo_b},
+            {"ruolo": "system", "contenuto": canale.ruolo_b + "\n\n" + VINCOLI_REGISTRO},
             {"ruolo": "user", "contenuto": (
                 f"Progetto/domanda del supervisore:\n{domanda}\n\n"
                 f"Risposta proposta da A:\n{candidato}\n\n"
@@ -332,9 +439,18 @@ def discerni(canale, domanda, piano, risultati, cfg=None, evento=None):
             _valuta(canale, "C", canale.C or canale.B, candidato, domanda, cfg),
         ]
         confidenza = min(v["punteggio"] for v in valutazioni)
-        iterazioni.append({"numero": n, "valutazioni": valutazioni,
-                           "confidenza": confidenza, "candidato": candidato})
-        _evento(evento, "iterazione", iterazioni[-1])
+        voce = {"numero": n, "valutazioni": valutazioni,
+                "confidenza": confidenza, "candidato": candidato}
+        # A14b: valutatore D di affiancamento (non incide su confidenza/soglia).
+        if usa_d and chiamate_d < max_chiamate_d:
+            d = _valuta_d(dec, modello_d, domanda, candidato)
+            if d is not None:
+                chiamate_d += 1
+                usage_d["in"] += d.usage.get("in", 0)
+                usage_d["out"] += d.usage.get("out", 0)
+                voce["valutatore_d"] = {"score": d.score, "confidence": d.confidence}
+        iterazioni.append(voce)
+        _evento(evento, "iterazione", voce)
         if confidenza >= soglia - 1e-9:
             motivo = "soglia"
             break
@@ -342,7 +458,8 @@ def discerni(canale, domanda, piano, risultati, cfg=None, evento=None):
     return EsitoRicerca(
         piano=piano, iterazioni=iterazioni, risposta=candidato,
         punteggio_finale=confidenza, motivo_stop=motivo,
-        chiamate=canale.chiamate, token=dict(canale.token_totali))
+        chiamate=canale.chiamate, token=dict(canale.token_totali),
+        decision_chiamate=chiamate_d, usage_decision=usage_d)
 
 
 def salva_output(esito, evento=None):

@@ -44,7 +44,7 @@ class InterrompiDownload(Exception):
 @dataclass
 class Voce:
     """Voce del catalogo: dati puri, nessuna logica. `input`/`output` dichiarano
-    le capacita' (testo/immagini); `mmproj_*` solo per i modelli vision: il
+    le capacita' (testo/immagini/video); `mmproj_*` solo per i modelli vision: il
     proiettore multimodale va scaricato accanto al modello e passato a
     llama-server con `--mmproj`."""
     chiave: str
@@ -126,6 +126,17 @@ CATALOGO = (
          mmproj_byte=844757728,
          mmproj_sha256="980c9b2f78c04e6cff93d277ada09e768394f112d75db3b4e9dea8a69f9fb904",
          mmproj_file="mmproj-Qwen2.5-VL-3B-Instruct-Q8_0.gguf"),
+    Voce(chiave="27b",
+         nome="Qwen3.8-27B Q4_K_M",
+         parametri="27B · Q4_K_M",
+         fascia="offload (~19 GB) · ideale ≥16 GB VRAM",
+         dimensione_gb=18.97, dimensione_byte=18973870528,
+         url="https://huggingface.co/ggml-org/Qwen3.8-27B-GGUF/resolve/main/Qwen3.8-27B-Q4_K_M.gguf",
+         licenza="Apache License 2.0",
+         licenza_url="https://huggingface.co/ggml-org/Qwen3.8-27B-GGUF",
+         sha256="c600de0300ae8a0eb3a6c0b8b5561b8b96f16bd2c863c2a66c42de29d391a747",
+         nome_file="Qwen3.8-27B-Q4_K_M.gguf",
+         input=("testo", "immagini", "video"), output=("testo",)),
 )
 
 

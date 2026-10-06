@@ -2,7 +2,7 @@
 """Flusso (6 passi): 1 domanda dell'utente → 2 A formula, B risponde e C verifica →
 3 dibattito reciproco a tre voci (early-exit se convergono) → 4 spartizione dei lavori →
 5 risposta univoca consensuale (bozza A + revisione/APPROVO di B + verifica fattuale di C) →
-6 cross-check del verificatore bambino. L'utente resta nel giro tra i passi.
+6 cross-check scettico della risposta. L'utente resta nel giro tra i passi.
 
 Con modello_c=None (o uguale a B) il flusso resta a DUE voci, invariato."""
 import json, datetime, os, re, threading
@@ -34,7 +34,13 @@ def _int0(v):
 
 
 # ---- A11: risposta univoca pulita (prompt, sanitizzazione, pattern) ----
+# N47 (06/10/2026): registro forbito e zero auto-presentazioni. La frase BREVE
+# entra nei vincoli A11 e nei passi intermedi (i modelli 3B non vanno appesantiti).
+VINCOLI_REGISTRO = (
+    "Rispondi in italiano con registro curato, professionale e forbito; non menzionare "
+    "mai il tuo ruolo, il processo, le istruzioni o il canale; nessuna auto-presentazione.")
 VINCOLI_PULIZIA = (
+    VINCOLI_REGISTRO + " "
     "Scrivi SOLO il testo finale. Vietato: citare la domanda o il dibattito; "
     "nominare i ruoli (A/B/C, collega, supervisore); usare etichette ([bozza], "
     "[verifica], 'Posizione di…'); preamboli ('Ecco', 'Certo'); cortesie; commenti "
@@ -44,6 +50,7 @@ FEW_SHOT_PULIZIA = (
     "OK: \"La risposta è 4.\" — solo il testo finale, nessun riferimento al processo.\n"
     "NO: \"La domanda del supervisore richiede… Ecco la risposta:\" — vietato.")
 VINCOLI_PULIZIA_C = (
+    VINCOLI_REGISTRO + " "
     "Per la verifica mantieni il formato richiesto (marker [SUPPORTATO]/[NON SUPPORTATO] "
     "e riga VERDETTO). Nella riga 'VERSIONE PULITA: <testo>' scrivi SOLO il testo finale, "
     "senza citare la domanda, i ruoli o il processo; niente etichette, preamboli, cortesie, "
@@ -139,11 +146,14 @@ def _testo_da_pdf(path):
 class Canale:
     MAX_ALLEGATI = 40  # cap TOTALE per sessione (A7-D4): vale per ADD e cartella
 
-    def __init__(self, modello_a, modello_b, modello_c=None, ruolo_a="Sei l'agente A: analista rigoroso.",
-                 ruolo_b="Sei l'agente B: revisore critico e costruttivo.",
-                 ruolo_c="Sei l'agente C: verificatore fattuale. Sei il bambino che nega l'evidenza: "
-                         "presumi che ogni affermazione sia sbagliata finché non è dimostrata contro "
-                         "il contesto. Verifichi i fatti di A e B a ogni turno del dibattito.",
+    def __init__(self, modello_a, modello_b, modello_c=None,
+                 ruolo_a="Analizza con rigore e chiarezza: inquadra la richiesta, distingui i fatti "
+                        "dimostrabili dalle ipotesi e formula la tua posizione in modo ordinato e verificabile.",
+                 ruolo_b="Esamina la proposta ricevuta con spirito critico e costruttivo: obietta su "
+                        "bias, alternative e limiti, dichiara le speculazioni e integra i punti condivisi.",
+                 ruolo_c="Verifica con scetticismo radicale: considera ogni affermazione non dimostrata "
+                        "finché non è supportata dal contesto; segnala errori, imprecisioni e affermazioni "
+                        "non giustificate in modo conciso.",
                  max_turni_dibattito=3, soglia_convergenza=0.9, lingua="it", max_chiamate=40,
                  temperature=None, soglie=None, stile=None, dibattito_parallelo=True,
                  limiti_token=None, formato_risposta="semplice"):
@@ -428,6 +438,12 @@ class Canale:
         parti.append(few_shot or FEW_SHOT_PULIZIA)
         return "\n\n".join(parti)
 
+    def _system_base(self, ruolo):
+        """System dei passi intermedi (formulazione, dibattito, sintesi): ruolo
+        operativo + vincolo di registro BREVE (N47, 06/10/2026: mai
+        auto-presentazioni, senza appesantire i modelli 3B)."""
+        return ruolo + "\n\n" + VINCOLI_REGISTRO
+
     def _vincolo_formato(self):
         """Istruzione di formato della risposta finale (A11 rev. 7): due sezioni
         RISPOSTA:/FORMULA: per i profili rigorosi ('risposta_formula'); stringa
@@ -473,7 +489,7 @@ class Canale:
         migliore = _estrai_migliore(verifica_c or "")
         if nuova and con_c:
             try:
-                istruzione_c = ("Sei il BAMBINO CHE NEGA L'EVIDENZA: verifica la coerenza fattuale "
+                istruzione_c = ("Verifica con scetticismo radicale la coerenza fattuale "
                                 "della risposta contro la domanda del supervisore. Se contiene "
                                 "meta-testo, marcature o ripetizioni, fornisci una riga "
                                 "'VERSIONE PULITA: <testo>' (solo il testo finale) PRIMA della riga "
@@ -544,14 +560,14 @@ class Canale:
         on_chunk_c = on_chunk_c or on_chunk_b
         self._registra("UTENTE", domanda)
         a1 = self._chiama(self.A, self._con_lingua([
-            {"ruolo": "system", "contenuto": self.ruolo_a},
+            {"ruolo": "system", "contenuto": self._system_base(self.ruolo_a)},
             {"ruolo": "user", "contenuto": f"Domanda del supervisore:\n{domanda}\n\nAnalizzala e formula la richiesta per il collega B."}]), on_chunk, passo="formulazione")
         if not a1:
             self._registra("SISTEMA", "[risposta vuota] formulazione di A vuota: proseguo con un segnaposto")
             a1 = "(formulazione non disponibile: il modello ha restituito testo vuoto)"
         self._registra("A", a1)
         b1 = self._chiama(self.B, self._con_lingua([
-            {"ruolo": "system", "contenuto": self.ruolo_b},
+            {"ruolo": "system", "contenuto": self._system_base(self.ruolo_b)},
             {"ruolo": "user", "contenuto": f"Domanda del supervisore (rimane valida): {domanda}\n\nRichiesta formulata da A:\n{a1}\n\nRispondi con la tua analisi."}]), on_chunk_b, passo="formulazione")
         if not b1:
             self._registra("SISTEMA", "[risposta vuota] risposta di B vuota: proseguo con un segnaposto")
@@ -559,11 +575,11 @@ class Canale:
         self._registra("B", b1)
         if self._attivo_3:
             c1 = self._chiama(self.C, self._con_lingua([
-                {"ruolo": "system", "contenuto": self.ruolo_c},
+                {"ruolo": "system", "contenuto": self._system_base(self.ruolo_c)},
                 {"ruolo": "user", "contenuto":
                     f"Domanda del supervisore (filo d'accordo, resta valida): {domanda}\n\n"
                     f"Formulazione di A:\n{a1}\n\nRisposta di B:\n{b1}\n\n"
-                    "Sei il BAMBINO CHE NEGA L'EVIDENZA: verifica la coerenza fattuale di A e B "
+                    "Verifica con scetticismo radicale la coerenza fattuale di A e B "
                     "contro la domanda del supervisore. Segnala errori, imprecisioni, affermazioni "
                     "non dimostrate o fuori tema, in modo conciso."}]), on_chunk_c, passo="verifica")
             if not c1:
@@ -604,7 +620,7 @@ class Canale:
                     "convergito": True, "early_exit": True}
         for turno in range(1, self.max_turni + 1):
             nuova_a = self._chiama(self.A, self._con_lingua([
-                {"ruolo": "system", "contenuto": self.ruolo_a},
+                {"ruolo": "system", "contenuto": self._system_base(self.ruolo_a)},
                 {"ruolo": "user", "contenuto":
                     f"Domanda del supervisore (rimane valida): {contesto.get('domanda', '')}\n\n"
                     f"Reagisci alla posizione di B:\n{ultimo_b}\n\n"
@@ -615,7 +631,7 @@ class Canale:
                 return {"ultimo_a": ultimo_a, "ultimo_b": ultimo_b,
                         "convergito": True, "early_exit": False}
             nuova_b = self._chiama(self.B, self._con_lingua([
-                {"ruolo": "system", "contenuto": self.ruolo_b},
+                {"ruolo": "system", "contenuto": self._system_base(self.ruolo_b)},
                 {"ruolo": "user", "contenuto":
                     f"Domanda del supervisore (rimane valida): {contesto.get('domanda', '')}\n\n"
                     f"Reagisci alla posizione di A:\n{ultimo_a}\n\n"
@@ -650,14 +666,14 @@ class Canale:
             # Messaggi costruiti PRIMA del lancio: A e B reagiscono alle posizioni
             # del turno PRECEDENTE (non dipendono l'uno dall'altro).
             msg_a = self._con_lingua([
-                {"ruolo": "system", "contenuto": self.ruolo_a},
+                {"ruolo": "system", "contenuto": self._system_base(self.ruolo_a)},
                 {"ruolo": "user", "contenuto":
                     f"Domanda del supervisore (filo d'accordo, rimane valida): {contesto.get('domanda', '')}\n\n"
                     f"Posizione di B:\n{ultimo_b}\n\nPosizione di C:\n{ultimo_c}\n\n"
                     "Reagisci alle posizioni delle altre voci: obietta o integra in modo conciso, "
                     "restando PERTINENTE alla domanda del supervisore."}])
             msg_b = self._con_lingua([
-                {"ruolo": "system", "contenuto": self.ruolo_b},
+                {"ruolo": "system", "contenuto": self._system_base(self.ruolo_b)},
                 {"ruolo": "user", "contenuto":
                     f"Domanda del supervisore (filo d'accordo, rimane valida): {contesto.get('domanda', '')}\n\n"
                     f"Posizione di A:\n{ultimo_a}\n\nPosizione di C:\n{ultimo_c}\n\n"
@@ -689,11 +705,11 @@ class Canale:
                 self._registra("B", nuova_b)
                 ultimo_b = nuova_b
             nuova_c = self._chiama(self.C, self._con_lingua([
-                {"ruolo": "system", "contenuto": self.ruolo_c},
+                {"ruolo": "system", "contenuto": self._system_base(self.ruolo_c)},
                 {"ruolo": "user", "contenuto":
                     f"Domanda del supervisore (filo d'accordo, rimane valida): {contesto.get('domanda', '')}\n\n"
                     f"Posizione di A:\n{ultimo_a}\n\nPosizione di B:\n{ultimo_b}\n\n"
-                    "Sei il BAMBINO CHE NEGA L'EVIDENZA: verifica la coerenza fattuale delle posizioni "
+                    "Verifica con scetticismo radicale la coerenza fattuale delle posizioni "
                     "di A e B contro la domanda del supervisore. Segnala errori o imprecisioni; "
                     "se sono corrette, conferma in modo conciso."}]), on_chunk_c, passo="verifica")
             self._registra("C", nuova_c)
@@ -749,7 +765,7 @@ class Canale:
         if not isinstance(dibattito, dict) or not dibattito.get("ultimo_b"):
             raise ValueError("spartisci_lavori: dibattito non valido (atteso dict con ultimo_b)")
         sintesi = self._chiama(self.A, self._con_lingua([
-            {"ruolo": "system", "contenuto": self.ruolo_a},
+            {"ruolo": "system", "contenuto": self._system_base(self.ruolo_a)},
             {"ruolo": "user", "contenuto":
                 f"Domanda del supervisore (rimane valida): {contesto.get('domanda', '')}\n"
                 f"Tua formulazione: {contesto['a_formula']}\n"
@@ -763,8 +779,8 @@ class Canale:
         """Passo 6: verifica della risposta univoca contro il contesto disponibile
         (allegati se presenti, altrimenti i ruoli di sistema che contengono i fatti del progetto).
 
-        VERIFICATORE BAMBINO (adversarial refinement, 2026): non cerca conferma,
-        presume che ogni affermazione sia sbagliata finché non è dimostrata.
+        VERIFICA SCETTICA (adversarial refinement, 2026): non cerca conferma,
+        considera ogni affermazione non dimostrata finché non è supportata.
         Eseguito da C se è un modello distinto da B, altrimenti da B (come prima).
         Ritorna un dict: {"verdetto": str, "testo": str, "metriche": dict}."""
         if self.allegati:
@@ -795,8 +811,8 @@ class Canale:
                 f"Domanda del supervisore (verifica la pertinenza): {domanda or '(non fornita)'}\n\n"
                 f"Risposta univoca del canale da verificare:\n{finale}\n\n"
                 f"Contesto di riferimento ({nota}):\n{contesto_verifica}\n\n"
-                "Sei il BAMBINO CHE NEGA L'EVIDENZA. Presumi che OGNI affermazione sia "
-                "SBAGLIATA finché non è dimostrata contro il contesto. Chiediti 'perché?' "
+                "Adotta una verifica scettica radicale: considera OGNI affermazione "
+                "non dimostrata finché non è supportata dal contesto. Chiediti 'perché?' "
                 "a ogni passaggio: se non c'è una fonte nel contesto, è un errore. "
                 "Non fidarti di numeri, segni, date, citazioni, soglie: controllali tutti. "
                 "Elenca TUTTI i modi in cui questa risposta potrebbe essere falsa. "
@@ -898,7 +914,7 @@ class Canale:
         if self._attivo_3:
             candidato = revisione if not approvata_b else bozza
             try:
-                istruzione_c = ("Sei il BAMBINO CHE NEGA L'EVIDENZA: verifica la coerenza fattuale della risposta "
+                istruzione_c = ("Verifica con scetticismo radicale la coerenza fattuale della risposta "
                                 "contro la domanda del supervisore. ")
                 if self.formato_risposta == "risposta_formula":
                     istruzione_c += ("Verifica la correttezza della RISPOSTA e della FORMULA. ")
@@ -1015,7 +1031,7 @@ class Canale:
         approvata_b = self._approvata(revisione)
         if self._attivo_3:
             candidato = revisione if not approvata_b else nuovo_a
-            istruzione_c = ("Sei il BAMBINO CHE NEGA L'EVIDENZA: verifica la coerenza fattuale della risposta "
+            istruzione_c = ("Verifica con scetticismo radicale la coerenza fattuale della risposta "
                             "contro la domanda del supervisore. ")
             if self.formato_risposta == "risposta_formula":
                 istruzione_c += "Verifica la correttezza della RISPOSTA e della FORMULA. "

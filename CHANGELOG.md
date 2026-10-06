@@ -2,6 +2,23 @@
 
 Registro delle versioni di TRILogos — tutte le modifiche rilevanti.
 
+## [3.1.0] - 2026-10-06
+
+### Novità
+- **Contatore tok/s live + totale di sessione Σ** nella status bar
+  (`⚡ 42,3 tok/s · Σ 12.345`): stima dal flusso reale, media del passo
+  dall'`eval_count`, reset a Svuota/nuova sessione.
+- **Decision models Ollama** (`/v1/systemone`, A14): valutatore **D** nel
+  percorso Ricerca, in affiancamento e **default spento**; non incide su
+  confidenza e soglia.
+- **Risposte dei tre modelli "forbite"**: registro curato, zero
+  auto-presentazioni, nessun riferimento al processo (canale e agenti).
+
+### Correzioni
+- **Fix critico "Svuota" → nuova domanda**: dopo Svuota il campo supervisore
+  torna pronto (focus nel campo, placeholder rimosso al primo tasto/incolla);
+  la nuova domanda entra sempre e il flusso riparte, anche dopo ⏹ Interrompi.
+
 ## [3.0.0] - 2026-10-06 — TRILogos 3.0 «ARCA Engine»
 
 ### Migliorie eclatanti

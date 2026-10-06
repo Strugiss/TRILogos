@@ -1,7 +1,7 @@
 # AGENTS.md — TRILogos (N47Lab)
 
 ## Cos'è
-TRILogos — orchestratore locale a tre voci (A · B · C) con risposta verificata: dibattito → sintesi → risposta univoca → cross-check → verdetto (CONFERMATA / DA_CORREGGERE / NON_CONCLUSO). Versione corrente: 3.0.0 (ARCA Engine).
+TRILogos — orchestratore locale a tre voci (A · B · C) con risposta verificata: dibattito → sintesi → risposta univoca → cross-check → verdetto (CONFERMATA / DA_CORREGGERE / NON_CONCLUSO). Versione corrente: 3.1.0 (ARCA Engine).
 
 ## Vincoli non negoziabili
 - **VINCOLO PRODOTTO (N47, 04/10/2026)**: TRILogos è un'applicazione **per gli utenti generici**, non sviluppata intorno a N47. Niente personalizzazioni, dati o contesti personali hardcoded; ogni contenuto specifico (contesti di progetto, profili) è caricato dall'utente (ADD / profili). Il branding N47Lab come autore/produttore resta legittimo.
