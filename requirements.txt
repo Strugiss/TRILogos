@@ -1,7 +1,7 @@
 # TRILogos — dipendenze essenziali
 requests>=2.34
 pypdf>=4.0
-pymupdf>=1.24  # fallback PDF
+# pymupdf>=1.24  # fallback PDF opzionale (estrazione più robusta): pip install pymupdf
 
 # Per i modelli locali: installa Ollama (https://ollama.com) e scarica un modello:
 #   ollama pull qwen2.5:3b

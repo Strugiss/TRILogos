@@ -40,10 +40,12 @@ FONT_H = ("Segoe UI", 11, "bold")
 def _punti_arrotondati(r, w, h):
     """Lista punti ESATTA di rounded.py per il rettangolo arrotondato smooth:
     la B-spline di Tk passa per i punti medi -> taglio reale 3px per lato.
-    h-1 e w-1: l'outline inferiore/destro resta dentro il canvas (0..h-1)."""
-    r = max(0, min(r, w / 2, h / 2))
-    return [0, r, 0, 0, r, 0, w - r, 0, w, 0, w, r, w, h - 1 - r, w, h - 1,
-            w - r, h - 1, r, h - 1, 0, h - 1, 0, h - 1 - r]
+    h-1 e w-1: l'outline inferiore/destro resta dentro il canvas (0..w-1/0..h-1);
+    il raggio è clampato a metà del lato utile, così il bordo destro non esce
+    mai dall'area visibile (fix bordo destro tagliato, F4-A/A5)."""
+    r = max(0, min(r, (w - 1) / 2, (h - 1) / 2))
+    return [0, r, 0, 0, r, 0, w - 1 - r, 0, w - 1, 0, w - 1, r, w - 1, h - 1 - r,
+            w - 1, h - 1, w - 1 - r, h - 1, r, h - 1, 0, h - 1, 0, h - 1 - r]
 
 
 # Riferimenti globali: le PhotoImage della freccia NON devono mai finire nel GC
@@ -89,6 +91,74 @@ def _configura_combo_ambra(stile, root):
             ]}),
         ]}),
     ])
+
+
+class Tooltip:
+    """Tooltip leggero riusabile per widget Tk: Toplevel overrideredirect con il
+    testo, mostrato dopo `delay` ms di hover e distrutto su <Leave>. Il testo può
+    essere una stringa o una funzione (valutata alla comparsa: utile per mostrare
+    il valore corrente di una combo). Si chiude anche su click e rotella, così
+    non restano finestre residue; nessun testo viene scritto su file o in rete."""
+    def __init__(self, widget, testo, delay=500):
+        self.widget = widget
+        self.testo = testo
+        self.delay = delay
+        self._after_id = None
+        self._finestra = None
+        widget.bind("<Enter>", self._entra, add="+")
+        widget.bind("<Leave>", self._esci, add="+")
+        widget.bind("<ButtonPress>", self._esci, add="+")
+        widget.bind("<MouseWheel>", self._esci, add="+")
+
+    def _entra(self, evento=None):
+        self._annulla()
+        try:
+            self._after_id = self.widget.after(self.delay, self._mostra)
+        except tk.TclError:
+            self._after_id = None
+
+    def _esci(self, evento=None):
+        self._annulla()
+        self._nascondi()
+
+    def _annulla(self):
+        if self._after_id is not None:
+            try:
+                self.widget.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+
+    def _testo_attuale(self):
+        try:
+            return self.testo() if callable(self.testo) else self.testo
+        except Exception:
+            return ""
+
+    def _mostra(self):
+        self._after_id = None
+        if self._finestra is not None:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 12
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        except tk.TclError:
+            return
+        self._finestra = tk.Toplevel(self.widget)
+        self._finestra.wm_overrideredirect(True)
+        self._finestra.wm_geometry(f"+{x}+{y}")
+        self._finestra.configure(bg=PALETTE["bordo_cornici"])
+        tk.Label(self._finestra, text=self._testo_attuale(), bg=PALETTE["campo"],
+                 fg=PALETTE["testo"], font=("Segoe UI", 9), justify="left",
+                 padx=8, pady=4).pack(padx=1, pady=1)
+
+    def _nascondi(self):
+        if self._finestra is not None:
+            try:
+                self._finestra.destroy()
+            except tk.TclError:
+                pass
+            self._finestra = None
 
 
 class RiquadroRotondo(tk.Canvas):
@@ -195,7 +265,13 @@ class ComboRotonda(tk.Canvas):
 class BoxArrotondato(tk.Canvas):
     """Box di testo con 4 angoli arrotondati: canvas + poligono campo #232429
     con bordo ambra 1px + tk.Text (create_window) + scrollbar ttk accorciata
-    6px in basso (angolo basso-destra libero). API del Text in .box."""
+    6px in basso (angolo basso-destra libero). API del Text in .box.
+
+    Con editabile=False il box è in "sola lettura selezionabile" (F4-A/A8):
+    state normal permanente (niente toggle durante lo streaming: la selezione
+    non si perde), insertwidth 0 (nessun caret), binding <Key> che lascia
+    passare solo navigazione/selezione/copia e blocca ogni modifica, menu
+    contestuale tasto destro con Copia / Copia tutto / Seleziona tutto."""
     def __init__(self, master, larghezza_ch=32, altezza_righe=4, bg=None, editabile=False):
         super().__init__(master, bg=bg or PALETTE["pannello"], highlightthickness=0, bd=0)
         self.box = tk.Text(self, wrap="word", width=larghezza_ch, height=altezza_righe,
@@ -203,9 +279,15 @@ class BoxArrotondato(tk.Canvas):
                            insertbackground=PALETTE["testo"], font=("Consolas", 10),
                            relief="flat", bd=0, highlightthickness=0,
                            selectbackground=PALETTE["selectbackground"],
-                           selectforeground=PALETTE["selectforeground"])
+                           selectforeground=PALETTE["selectforeground"],
+                           exportselection=0)
+        self._editabile = editabile
         if not editabile:
-            self.box.configure(state="disabled")
+            # Sola lettura SELEZIONABILE: il testo si modifica solo dal codice,
+            # la tastiera non può alterarlo (né digitazione né Ctrl+V/X/Z).
+            self.box.configure(insertwidth=0)
+            self.box.bind("<Key>", self._tasto_readonly)
+            self.box.bind("<Button-3>", self._menu_contestuale)
         self._scrollbar = ttk.Scrollbar(self, orient="vertical")
         self.box.configure(yscrollcommand=self._scrollbar.set)
         self._scrollbar.configure(command=self.box.yview)
@@ -235,6 +317,96 @@ class BoxArrotondato(tk.Canvas):
         self.coords(self._item_sb, lar - m - sb, m)
         self.itemconfigure(self._item_sb,
                            width=sb, height=max(10, alt - 2 * m - 6))
+
+    # ---- sola lettura selezionabile (F4-A/A8) ----
+    _TASTI_NAVIGAZIONE = ("Left", "Right", "Up", "Down", "Home", "End", "Prior", "Next",
+                          "Shift_L", "Shift_R", "Control_L", "Control_R")
+
+    def _tasto_readonly(self, evento):
+        """Blocca ogni modifica da tastiera lasciando passare navigazione
+        (frecce, Home/End, Prior/Next), selezione (Shift+frecce, Ctrl+A),
+        copia (Ctrl+C, Ctrl+Insert) e Tab/Shift+Tab come spostamento focus.
+        Ogni altro tasto (caratteri, BackSpace, Delete, Return, Ctrl+V/X/Z)
+        ritorna "break": il Text non lo elabora."""
+        t = evento.keysym
+        if t == "Tab":
+            self.box.tk_focusNext().focus_set()
+            return "break"
+        if t == "ISO_Left_Tab":
+            self.box.tk_focusPrev().focus_set()
+            return "break"
+        if evento.state & 0x4:  # Control premuto
+            if t.lower() in ("c", "a") or t == "Insert":
+                return None
+            return "break"
+        if t in self._TASTI_NAVIGAZIONE:
+            return None
+        return "break"
+
+    def _menu_contestuale(self, evento):
+        """Menu tasto destro del box di output: Copia / Copia tutto / Seleziona
+        tutto. Temporaneo (creato a ogni click), colori della palette.
+        F4-E: il focus torna al box PRIMA di leggere la selezione (con
+        exportselection=0 la selezione non si perde all'apertura del menu)."""
+        try:
+            self.box.focus_set()
+        except tk.TclError:
+            pass
+        try:
+            selezione = self.box.get("sel.first", "sel.last")
+        except tk.TclError:
+            selezione = ""
+        menu = tk.Menu(self.box, tearoff=0,
+                       bg=PALETTE["campo"], fg=PALETTE["testo"],
+                       activebackground=PALETTE["ambra"],
+                       activeforeground=PALETTE["testo_su_ambra"],
+                       bd=0, relief="flat")
+        menu.add_command(label="Copia", command=self._copia_selezione,
+                         state="normal" if selezione else "disabled")
+        menu.add_command(label="Copia tutto", command=self._copia_tutto)
+        menu.add_command(label="Seleziona tutto", command=self._seleziona_tutto)
+        try:
+            menu.tk_popup(evento.x_root, evento.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    def _copia(self, testo):
+        """Copia nella clipboard LOCALE: nessun invio in rete, nessun log del
+        contenuto, nessuna scrittura su file."""
+        if not testo:
+            return
+        try:
+            self.box.clipboard_clear()
+            self.box.clipboard_append(testo)
+            self.box.update_idletasks()
+        except tk.TclError:
+            pass
+
+    def _copia_selezione(self):
+        """Copia la selezione corrente (F4-E: focus al box prima di leggerla)."""
+        try:
+            self.box.focus_set()
+        except tk.TclError:
+            pass
+        try:
+            self._copia(self.box.get("sel.first", "sel.last"))
+        except tk.TclError:
+            pass
+
+    def _copia_tutto(self):
+        self._copia(self.box.get("1.0", "end-1c"))
+
+    def _seleziona_tutto(self):
+        """Seleziona tutto il testo (F4-E: focus al box, selezione visibile e
+        copiabile con Ctrl+C)."""
+        try:
+            self.box.focus_set()
+        except tk.TclError:
+            pass
+        self.box.tag_add("sel", "1.0", "end-1c")
+        self.box.mark_set("insert", "1.0")
+        return "break"
 
 
 class Pill(tk.Canvas):
@@ -311,9 +483,9 @@ class Colonna(ttk.Frame):
             self.lbl_modello.configure(text=testo)
 
     def scrivi(self, testo):
-        self.box.configure(state="normal")
+        """Scrittura programmatica in coda: nel regime readonly selezionabile
+        NON ci sono toggle di state (la selezione dell'utente resta intatta)."""
         self.box.insert("end", testo + "\n\n")
-        self.box.configure(state="disabled")
         self.box.see("end")
 
 

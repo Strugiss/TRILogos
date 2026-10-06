@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trilogos"
-version = "2.0.0"
+version = "3.0.0"
 description = "TRILogos — three-voice dialogue with verified answers, local-first"
 readme = "README.md"
 license = "MIT"
@@ -13,7 +13,6 @@ requires-python = ">=3.9"
 dependencies = [
     "requests>=2.34",
     "pypdf>=4.0",
-    "pymupdf>=1.24",
 ]
 authors = [
     { name = "N47Lab" },
@@ -24,6 +23,9 @@ classifiers = [
     "Environment :: Win32 (MS Windows)",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+
+[project.optional-dependencies]
+pdf = ["pymupdf>=1.24"]
 
 [project.scripts]
 trilogos-cli = "cli:main"

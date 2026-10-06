@@ -2,25 +2,52 @@
   "profili": {
     "Generico": {
       "A": "Sei l'agente A: analista rigoroso, chiaro e strutturato. Ricevi la domanda del supervisore, la analizzi e la formuli per il collega B. Certezza solo su ciò che puoi dimostrare.",
-      "B": "Sei l'agente B: revisore critico e propositivo. Ricevi la richiesta formulata da A, la analizzi, obietti con rigore (bias, alternative, limiti) e collabori alla spartizione dei lavori. Niente speculazioni non dichiarate."
+      "B": "Sei l'agente B: revisore critico e propositivo. Ricevi la richiesta formulata da A, la analizzi, obietti con rigore (bias, alternative, limiti) e collabori alla spartizione dei lavori. Niente speculazioni non dichiarate.",
+      "stile": "linguaggio chiaro e rigoroso, frasi brevi, nessuna opinione non dichiarata",
+      "formato_risposta": "risposta_formula"
     },
     "Creativo": {
       "A": "Sei l'agente A: generatore di idee. Ricevi la domanda del supervisore, la sviluppi in proposte originali e le formuli per il collega B.",
-      "B": "Sei l'agente B: ingegnere della fattibilità. Valuti le proposte di A, le confronti con vincoli pratici e le integri con soluzioni realizzabili."
+      "B": "Sei l'agente B: ingegnere della fattibilità. Valuti le proposte di A, le confronti con vincoli pratici e le integri con soluzioni realizzabili.",
+      "stile": "tono propositivo, idee concrete e verificabili, nessuna opinione non dichiarata"
     },
     "Costruttivo": {
       "A": "Sei l'agente A: costruttore di soluzioni. Ricevi la domanda del supervisore, la scomponi in passi concreti e la formuli per il collega B.",
-      "B": "Sei l'agente B: verificatore di qualità. Controlli i passi di A, ne segnali le debolezze e proponi miglioramenti pratici."
+      "B": "Sei l'agente B: verificatore di qualità. Controlli i passi di A, ne segnali le debolezze e proponi miglioramenti pratici.",
+      "stile": "linguaggio tecnico essenziale, passi concreti, limiti dichiarati"
+    },
+    "Veloce": {
+      "A": "Sei l'agente A: analista rigoroso e sintetico. Rispondi in modo diretto e formula la richiesta per B.",
+      "B": "Sei l'agente B: revisore critico e sintetico. Verifica la richiesta di A e collabora alla risposta.",
+      "stile": "risposte brevi e dirette, niente opinioni non dichiarate",
+      "formato_risposta": "risposta_formula",
+      "modelli": {
+        "A": "qwen2.5:3b · ollama",
+        "B": "llama3.2:3b · ollama",
+        "C": "qwen2.5:3b · ollama"
+      },
+      "max_turni_dibattito": 2
+    },
+    "Ricerca": {
+      "A": "Sei il ricercatore A di TRILogos: analista rigoroso. Ricevi il progetto del supervisore, lo analizzi, pianifichi con i colleghi la squadra di agenti specializzati necessaria (solo quelli utili) e guidi la formulazione della risposta finale. Certezza solo su ciò che puoi dimostrare; dichiari i limiti.",
+      "B": "Sei il ricercatore B di TRILogos: revisore critico. Obietti con rigore (bias, alternative, limiti di potenza), integri il piano di A e ne verifichi la fattibilità. Pretendi certezze solo dimostrate; nessuna speculazione non dichiarata.",
+      "C": "Sei il ricercatore C di TRILogos: verificatore. Presumi che ogni affermazione sia sbagliata finché non è dimostrata; controlli formato, fatti e fattibilità del piano e dei risultati. Sei il bambino che nega l'evidenza.",
+      "stile": "linguaggio rigoroso, limiti dichiarati, niente opinioni; frasi brevi",
+      "formato_risposta": "risposta_formula"
     }
   },
   "modelli": {
     "A": {
-      "tipo": "mock",
-      "modello": null
+      "tipo": "ollama",
+      "modello": "deepseek-r1:14b"
     },
     "B": {
-      "tipo": "mock",
-      "modello": null
+      "tipo": "ollama",
+      "modello": "qwen2.5:3b"
+    },
+    "C": {
+      "tipo": "ollama",
+      "modello": "llama3.2:3b"
     }
   },
   "canale": {
@@ -31,10 +58,42 @@
       "A": 0.2,
       "B": 0.5,
       "C": 0.87
+    },
+    "dibattito_parallelo": true,
+    "limiti_token": {
+      "formulazione": 400,
+      "dibattito": 300,
+      "sintesi": 400,
+      "univoca": 400,
+      "revisione": 400,
+      "verifica": 300
     }
   },
   "rete": {
     "timeout_connect": 10,
     "timeout_read": 120
+  },
+  "ollama": {
+    "keep_alive": -1,
+    "num_ctx": 8192
+  },
+  "ricerca": {
+    "soglia_ottimo": 8.99,
+    "max_agenti": 6,
+    "max_iterazioni": 3,
+    "temperatura_piano": 0.1,
+    "temperatura_agenti": 0.4,
+    "temperatura_valutazione": 0.1,
+    "max_chiamate": 200,
+    "limite_risposta": 700
+  },
+  "timeline": {
+    "author": {
+      "name": "Utente",
+      "affiliation": "",
+      "orcid": "",
+      "background": "",
+      "ai_role": "cognitive_prosthesis"
+    }
   }
 }

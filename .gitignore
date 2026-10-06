@@ -5,13 +5,21 @@ __pycache__/
 *.pyc
 sessioni/*
 dev/
+profili_locali.json
 profili_n47lab.json
+profili_*.json
 clienti.json
 timeline.json
+stato.json
+stato_*.tmp
 log_gui.txt
 *.log
 Backup/
 icona_trilogos.jpg
+
+# Documenti interni QA e asset sorgente (non pubblicati)
+Documenti/
+Immagini/
 
 # Artefatti packaging
 dist/

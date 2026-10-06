@@ -94,7 +94,9 @@ def _open():
 
 def _ollama():
     try:
-        r = requests.get("http://localhost:11434/api/tags", timeout=4)
+        # timeout 2s: i probe girano in thread, il valore ridotto è solo igiene
+        # (avvio rapido con server spenti); vedi A3 del design.
+        r = requests.get("http://localhost:11434/api/tags", timeout=2)
         if r.ok:
             modelli = [m["name"] for m in r.json().get("models", []) if m.get("name")]
             if modelli:
@@ -111,7 +113,8 @@ def _compat_openai(porta, nome, chiave_fittizia=""):
     if chiave_fittizia:
         headers["Authorization"] = f"Bearer {chiave_fittizia}"
     try:
-        r = requests.get(base + "/models", timeout=3, headers=headers)
+        # timeout 1.5s: come _ollama, il probe gira fuori dal thread UI (A3).
+        r = requests.get(base + "/models", timeout=1.5, headers=headers)
         if r.ok:
             modelli = [m["id"] for m in r.json().get("data", []) if m.get("id")]
             if modelli:
@@ -284,26 +287,13 @@ def _e_locale(base_url):
     return p.hostname in ("localhost", "127.0.0.1", "::1")
 
 
-def rileva_clienti():
-    """Tutti i clienti disponibili, nell'ordine: opencode -> ollama -> openai ->
-    anthropic -> lmstudio -> jan -> registro utente.
-
-    I clienti di default sono SEMPRE presenti:
-      - ollama:    modelli reali se il server risponde, altrimenti NESSUN modello;
-      - openai:    base https://api.openai.com/v1, chiave = NOME env
-                   OPENAI_API_KEY, modelli ['gpt-4o-mini', 'gpt-4o'];
-      - anthropic: base https://api.anthropic.com/v1, chiave = NOME env
-                   ANTHROPIC_API_KEY, modelli ['claude-3-5-sonnet-latest'];
-      - lmstudio:  base http://localhost:1234/v1, chiave 'lm-studio', modelli
-                   ['lm-studio-model'] se il server non risponde, altrimenti i reali;
-      - jan:       base http://localhost:1337/v1, chiave 'jan-local-key', modelli
-                   ['jan-model'] se il server non risponde, altrimenti i reali.
-    La chiave resta SEMPRE il NOME della variabile d'ambiente (o la chiave
-    fittizia per lmstudio/jan), MAI il valore.
-
-    I provider LOCALI (base localhost/127.0.0.1) da opencode/registro vengono
-    filtrati sui modelli reali di Ollama: le voci inesistenti sono rimosse e un
-    cliente locale rimasto senza modelli viene saltato. Il cloud NON è filtrato."""
+def _componi(ollama, lm, jan, filtra_locali):
+    """Composizione UNICA della lista clienti (condivisa da rileva_clienti e
+    clienti_base), nell'ordine: opencode -> ollama -> openai -> anthropic ->
+    lmstudio -> jan -> registro utente. `filtra_locali=True` (rilevamento con
+    rete): i clienti locali sono filtrati sui modelli reali di Ollama e quelli
+    rimasti senza modelli vengono saltati; `filtra_locali=False` (base, senza
+    rete): i clienti passano interi, senza filtri."""
     clienti = []
     visti = set()
 
@@ -314,15 +304,11 @@ def rileva_clienti():
         visti.add(nome)
         clienti.append(c)
 
-    ollama = _ollama()
-    if ollama:
-        reali = set(ollama[0].get("modelli", []))
-    else:
-        reali = set()
+    reali = set(ollama[0].get("modelli", [])) if ollama else set()
 
     for c in _open():
         c = dict(c)
-        if _e_locale(c.get("base_url", "")):
+        if filtra_locali and _e_locale(c.get("base_url", "")):
             c["modelli"] = [m for m in c.get("modelli", []) if m in reali]
             if not c["modelli"]:
                 continue
@@ -341,18 +327,12 @@ def rileva_clienti():
               "chiave": "ANTHROPIC_API_KEY",
               "modelli": ["claude-3-5-sonnet-latest"]})
 
-    lm = _compat_openai(1234, "lmstudio", chiave_fittizia="lm-studio")
-    if not lm:
-        lm = _compat_openai(1234, "lmstudio")
     if lm:
         aggiungi(lm[0])
     else:
         aggiungi({"nome": "lmstudio", "base_url": "http://localhost:1234/v1",
                   "chiave": "lm-studio", "modelli": ["lm-studio-model"]})
 
-    jan = _compat_openai(1337, "jan", chiave_fittizia="jan-local-key")
-    if not jan:
-        jan = _compat_openai(1337, "jan")
     if jan:
         aggiungi(jan[0])
     else:
@@ -361,12 +341,51 @@ def rileva_clienti():
 
     for c in aggiunti():
         c = dict(c)
-        if _e_locale(c.get("base_url", "")):
+        if filtra_locali and _e_locale(c.get("base_url", "")):
             c["modelli"] = [m for m in c.get("modelli", []) if m in reali]
             if not c["modelli"]:
                 continue
         aggiungi(c)
     return clienti
+
+
+def rileva_clienti():
+    """Tutti i clienti disponibili, nell'ordine: opencode -> ollama -> openai ->
+    anthropic -> lmstudio -> jan -> registro utente. Esegue i probe di rete
+    (Ollama/LM Studio/Jan): per l'avvio rapido della GUI usare clienti_base()
+    e chiamare questa in un thread.
+
+    I clienti di default sono SEMPRE presenti:
+      - ollama:    modelli reali se il server risponde, altrimenti NESSUN modello;
+      - openai:    base https://api.openai.com/v1, chiave = NOME env
+                   OPENAI_API_KEY, modelli ['gpt-4o-mini', 'gpt-4o'];
+      - anthropic: base https://api.anthropic.com/v1, chiave = NOME env
+                   ANTHROPIC_API_KEY, modelli ['claude-3-5-sonnet-latest'];
+      - lmstudio:  base http://localhost:1234/v1, chiave 'lm-studio', modelli
+                   ['lm-studio-model'] se il server non risponde, altrimenti i reali;
+      - jan:       base http://localhost:1337/v1, chiave 'jan-local-key', modelli
+                   ['jan-model'] se il server non risponde, altrimenti i reali.
+    La chiave resta SEMPRE il NOME della variabile d'ambiente (o la chiave
+    fittizia per lmstudio/jan), MAI il valore.
+
+    I provider LOCALI (base localhost/127.0.0.1) da opencode/registro vengono
+    filtrati sui modelli reali di Ollama: le voci inesistenti sono rimosse e un
+    cliente locale rimasto senza modelli viene saltato. Il cloud NON è filtrato.
+    La composizione è condivisa con clienti_base() (helper _componi)."""
+    ollama = _ollama()
+    lm = _compat_openai(1234, "lmstudio", chiave_fittizia="lm-studio") \
+        or _compat_openai(1234, "lmstudio")
+    jan = _compat_openai(1337, "jan", chiave_fittizia="jan-local-key") \
+        or _compat_openai(1337, "jan")
+    return _componi(ollama, lm, jan, filtra_locali=True)
+
+
+def clienti_base():
+    """Clienti di default e del registro SENZA rete (avvio GUI immediato):
+    ollama senza modelli, openai/anthropic/lmstudio/jan coi default, registro
+    utente invariato (il filtro sui modelli reali richiede la rete e resta a
+    rileva_clienti). Stessa composizione tramite _componi."""
+    return _componi(None, None, None, filtra_locali=False)
 
 
 def voci_modelli(clienti, con_mock=True):

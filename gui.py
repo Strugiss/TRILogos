@@ -3,7 +3,7 @@
 dibattito → sintesi e spartizione → risposta univoca consensuale →
 cross-check automatico (verificatore bambino) con verdetto finale.
 Layout TRIVOICE: barra SUPERVISORE (84px) + riga 4 riquadri (420px:
-pulsanti 200 + LLM1/LLM2/LLM3 325×3) + risposta univoca (142px).
+pulsanti 200 + LLM1/LLM2/LLM3 325×3) + risposta univoca (284px).
 Selettore lingua (7 lingue) per interfaccia e risposte dei modelli."""
 import sys, os, json, threading, queue, traceback, time, socket, webbrowser
 from urllib.parse import urlparse
@@ -42,21 +42,32 @@ def _errore_import(e):
     messagebox.showerror("TRILogos — errore di avvio", str(e))
     sys.exit(1)
 
-from labgui import Finestra, Colonna, PALETTE, FONT_B, FONT_H, RiquadroRotondo, ComboRotonda, BoxArrotondato, Pill
+from labgui import (Finestra, Colonna, PALETTE, FONT_B, FONT_H, RiquadroRotondo,
+                    ComboRotonda, BoxArrotondato, Pill, Tooltip)
 from rounded import PulsanteRotondo
 try:
-    from core.clienti import (rileva_clienti, voci_modelli, aggiunti, salva_aggiunti,
+    from core.clienti import (rileva_clienti, clienti_base, voci_modelli, aggiunti, salva_aggiunti,
                               aggiungi_cliente, rimuovi_cliente, stato_locale,
                               stato_opencode, trova_client, LOCALI as LOCALI_INFO)
     from core.timeline import aggiungi_sessione
     from core.canale import Canale
-    from core.modelli import crea_modello, modello_da_voce as _modello_da_voce_core
+    from core import stato as _stato
+    from core import perimetro
+    from core.modelli import crea_modello, modello_da_voce as _modello_da_voce_core, TIMEOUT_RETE
+    from core import motore as _motore
+    from core import downloader as _downloader
+    from core import profiler as _profiler
+    from core import pulizia as _pulizia
 except ImportError as e:
     _errore_import(e)
 
 
 # ---- etichetta lentezza modelli locali (menu + avvisi: unica fonte di verità) ----
-_SUFFISSO_LENTO = " (lento)"
+# Suffisso tradotto nelle 7 lingue: il menu mostra l'etichetta nella lingua attiva.
+_SUFFISSI_LENTO = {
+    "it": " (lento)", "en": " (slow)", "fr": " (lent)", "es": " (lento)",
+    "de": " (langsam)", "pt": " (lento)", "zh": " (慢)",
+}
 
 
 def _modello_lento(nome):
@@ -75,36 +86,64 @@ def _modello_lento(nome):
     return any(i in nome for i in indicatori)
 
 
-def _opzioni_etichettate(voci):
-    """Aggiunge ' (lento)' alle voci Ollama pesanti (regola _modello_lento):
-    'deepseek-r1:14b · ollama' -> 'deepseek-r1:14b (lento) · ollama'.
-    I modelli piccoli e i client NON-Ollama restano invariati. Il parser
-    (modello_da_voce qui sotto) rimuove l'etichetta prima di costruire il
-    modello: selezione e ricostruzione del canale funzionano in entrambi i casi."""
+def _modello_grande(nome):
+    """V6 (warmup): modello 'grande' (pesi >= 14B) per la regola ARCA 'un solo
+    grande alla volta': indicatori 14b/32b/70b nel nome. MAI passare la voce
+    del menu ('… (lento) · ollama'): qui arriva il NOME del modello."""
+    nome = (nome or "").lower()
+    return any(i in nome for i in ("14b", "32b", "70b"))
+
+
+def _spoglia_suffisso(nome):
+    """Rimuove dalla CODA del nome qualsiasi suffisso di lentezza noto (7 lingue):
+    l'etichetta può essere rimasta in una lingua diversa da quella attiva."""
+    for suff in _SUFFISSI_LENTO.values():
+        if nome.endswith(suff):
+            return nome[: -len(suff)]
+    return nome
+
+
+def _opzioni_etichettate(voci, lingua="it"):
+    """Aggiunge il suffisso di lentezza NELLA LINGUA ATTIVA alle voci Ollama
+    pesanti (regola _modello_lento): 'deepseek-r1:14b · ollama' ->
+    'deepseek-r1:14b (slow) · ollama' con lingua 'en'. I modelli piccoli e i
+    client NON-Ollama restano invariati. Il parser (modello_da_voce qui sotto)
+    rimuove qualsiasi suffisso noto prima di costruire il modello: selezione e
+    ricostruzione del canale funzionano in ogni lingua."""
+    suffisso = _SUFFISSI_LENTO.get(lingua, _SUFFISSI_LENTO["it"])
     etichettate = []
     for v in voci:
         if v.endswith(" · ollama"):
             nome = v[: -len(" · ollama")]
             if _modello_lento(nome):
-                v = nome + _SUFFISSO_LENTO + " · ollama"
+                v = nome + suffisso + " · ollama"
         etichettate.append(v)
     return etichettate
 
 
-def modello_da_voce(voce, clienti=None):
-    """Wrapper di core.modelli.modello_da_voce: rimuove l'etichetta
-    informativa ' (lento)' dal NOME della voce prima del parsing, così
-    'deepseek-r1:14b (lento) · ollama' costruisce ModelloOllama con modello
-    'deepseek-r1:14b'. La voce senza etichetta passa invariata."""
+def modello_da_voce(voce, clienti=None, timeout=None, keep_alive=None, num_ctx=None):
+    """Wrapper di core.modelli.modello_da_voce: rimuove dalla coda del NOME
+    qualsiasi etichetta di lentezza nota (7 lingue) prima del parsing, così
+    'deepseek-r1:14b (slow) · ollama' costruisce ModelloOllama con modello
+    'deepseek-r1:14b'. La voce senza etichetta passa invariata.
+    B2e: le voci del motore interno ('Nome (motore)', 7 lingue) costruiscono
+    l'adapter ModelloMotore (llama-server) invece dei client esterni.
+    `timeout`: tupla (connect, read) per i modelli di rete (None -> default core).
+    `keep_alive` (V3) e `num_ctx` (fix critico): solo per Ollama."""
+    if voce and _motore.e_voce_motore(voce):
+        percorso = _motore.percorso_da_voce(voce)
+        if not percorso:
+            raise ValueError(f"modello del motore interno non trovato: {voce}")
+        return _motore.crea_modello(percorso)
     if voce and " · " in voce:
         nome, client = voce.rsplit(" · ", 1)
-        if nome.endswith(_SUFFISSO_LENTO):
-            voce = nome[: -len(_SUFFISSO_LENTO)] + " · " + client
-    elif voce and voce.endswith(_SUFFISSO_LENTO):
-        voce = voce[: -len(_SUFFISSO_LENTO)]
-    return _modello_da_voce_core(voce, clienti)
+        voce = _spoglia_suffisso(nome) + " · " + client
+    elif voce:
+        voce = _spoglia_suffisso(voce)
+    return _modello_da_voce_core(voce, clienti, timeout=timeout,
+                                 keep_alive=keep_alive, num_ctx=num_ctx)
 
-VERSIONE = "2.0.0"
+VERSIONE = "3.0.0"
 
 def _supporta(fn, nome_param):
     """True se la funzione/metodo accetta il parametro (API Canale estesa, fase 2)."""
@@ -180,15 +219,27 @@ CONFIG = _carica_json(os.path.join(BASE, "config.json"))
 if CONFIG is None:
     CONFIG = _config_predefinita()
     _avviso_avvio("config.json non leggibile: uso i valori predefiniti. Controlla il file.")
-_PROFILI_LOCALI = os.path.join(BASE, "profili_n47lab.json")
-if not os.path.exists(_PROFILI_LOCALI):
-    _PROFILI_LOCALI = os.path.join(BASE, "dev", "profili_n47lab.json")
-if os.path.exists(_PROFILI_LOCALI):
-    _locali = _carica_json(_PROFILI_LOCALI)
+# Profili locali (non distribuiti): nome nuovo preferito, fallback legacy
+# profili_n47lab.json con avviso di deprecazione (A10b). Ordine: root poi dev/.
+_AVVISO_PROFILI_LEGACY = ""
+_PROFILI_CANDIDATI = (
+    os.path.join(BASE, "profili_locali.json"),
+    os.path.join(BASE, "dev", "profili_locali.json"),
+    os.path.join(BASE, "profili_n47lab.json"),
+    os.path.join(BASE, "dev", "profili_n47lab.json"),
+)
+for _cand in _PROFILI_CANDIDATI:
+    if not os.path.exists(_cand):
+        continue
+    _locali = _carica_json(_cand)
     if _locali is None:
-        _avviso_avvio("profili_n47lab.json non leggibile: uso solo i profili predefiniti. Controlla il file.")
+        _avviso_avvio(f"{os.path.basename(_cand)} non leggibile: uso solo i profili predefiniti. Controlla il file.")
     elif _locali:
         CONFIG.setdefault("profili", {}).update(_locali)
+    if os.path.basename(_cand) == "profili_n47lab.json":
+        _AVVISO_PROFILI_LEGACY = ("profili locali: rinomina profili_n47lab.json in profili_locali.json "
+                                  "(il vecchio nome sarà rimosso)")
+    break
 
 # ---- SPLASH BYOK (primo avvio): clienti locali live + chiavi cloud nel .env ----
 CLIENTI_LOCALI = [
@@ -279,56 +330,30 @@ def _base_e_locale(base_url):
 
 
 def _salva_flag_byok():
-    """Salva il flag byok_splash:true in config.json (SOLO alla chiusura dello
-    splash, se 'Non mostrare più' è spuntata). Il flag non è mai nel codice."""
-    percorso = os.path.join(BASE, "config.json")
-    try:
-        with open(percorso, encoding="utf-8") as f:
-            dati = json.load(f)
-        dati["byok_splash"] = True
-        with open(percorso, "w", encoding="utf-8") as f:
-            json.dump(dati, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-
-def _leggi_config():
-    """Rilegge config.json da disco (flag runtime: byok_splash, primo_flusso_ok).
-    Mai fidarsi della CONFIG in memoria (scritta una sola volta all'import)."""
-    percorso = os.path.join(BASE, "config.json")
-    try:
-        with open(percorso, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    """Salva il flag byok_splash in stato.json (SOLO alla chiusura dello splash,
+    se 'Non mostrare più' è spuntata). Il flag non è mai nel codice né nel
+    config.json tracciato: vive in core/stato.py (file locale gitignored)."""
+    _stato.imposta("byok_splash", True)
 
 
 def _primo_flusso_ok():
-    """True se il flag primo_flusso_ok è true in config.json: la prima domanda
+    """True se il flag primo_flusso_ok è attivo in stato.json: la prima domanda
     è stata conclusa con un flusso completo. Rilettura da disco a ogni chiamata."""
-    return bool(_leggi_config().get("primo_flusso_ok"))
+    return bool(_stato.leggi().get("primo_flusso_ok"))
 
 
 def _salva_flag_primo_flusso():
-    """Scrive il flag primo_flusso_ok:true in config.json SOLO se assente: marca
-    la PRIMA conclusione di un flusso completo (nessun altro flag toccato)."""
-    percorso = os.path.join(BASE, "config.json")
-    try:
-        with open(percorso, encoding="utf-8") as f:
-            dati = json.load(f)
-        if dati.get("primo_flusso_ok"):
-            return
-        dati["primo_flusso_ok"] = True
-        with open(percorso, "w", encoding="utf-8") as f:
-            json.dump(dati, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    """Scrive il flag primo_flusso_ok in stato.json SOLO se assente: marca la
+    PRIMA conclusione di un flusso completo (nessun altro flag toccato)."""
+    if _stato.leggi().get("primo_flusso_ok"):
+        return
+    _stato.imposta("primo_flusso_ok", True)
 
 TESTI = {
     "it": {
         "titolo": "TRILogos — dialogo a tre voci (supervisore · LLM1 · LLM2 · LLM3)",
         "supervisore": "SUPERVISORE",
-        "placeholder": "Scrivi la domanda e premi Invio o ▶",
+        "placeholder": "Scegli la cartella per il tuo progetto e scrivi qui il tuo prompt",
         "invia": "▶ Invia",
         "completo": "▶ Avvia (completo)",
         "dibattito": "💬 Dibattito",
@@ -336,6 +361,7 @@ TESTI = {
         "univoca": "✍️ Univoca",
         "salva": "💾 Salva",
         "svuota": "🗑 Svuota",
+        "interrompi": "⏹ Interrompi",
         "llm1": "LLM1",
         "llm2": "LLM2",
         "llm3": "LLM3",
@@ -351,15 +377,38 @@ TESTI = {
         "sint_ok": "sintesi e risposta univoca …",
         "fine_ok": "risposta univoca condivisa pronta",
         "opzioni": "⚙ Opzioni",
-        "cartella": "📁 Cartella",
+        "cartella": "📁 Progetto",
         "add": "➕ ADD",
+        "agenti": "🔎 Agenti",
         "cross": "🛡 Cross-check",
         "correggi": "✏️ Correggi",
+        # F4-E: cronometro, header e tooltip localizzati (7 lingue)
+        "crono_attesa": "in attesa",
+        "crono_passo": "passo",
+        "crono_totale": "totale",
+        "tt_lingua": "Lingua dell'interfaccia e delle risposte dei modelli",
+        "tt_profilo": "Profilo attivo: {v}",
+        "tt_modello": "Modello di {n}: {v}\nI modelli '(lento)' su CPU possono richiedere 2-5 minuti per risposta",
+        "tt_progetto": "Cartella progetto: {p}",
+        "tt_progetto_non": "Cartella progetto: (non scelta)",
+        "tt_invia": "Invia la domanda al canale",
+        "tt_completo": "Esegue il flusso completo a 6 passi",
+        "tt_dibattito": "Esegue solo il dibattito tra le voci",
+        "tt_sintesi": "Esegue sintesi, spartizione e risposta univoca",
+        "tt_univoca": "Esegue solo la risposta univoca",
+        "tt_cross": "Esegue il cross-check del verificatore",
+        "tt_correggi": "Corregge la risposta seguendo i punti del verificatore (max 3 giri)",
+        "tt_salva": "Salva la sessione in JSON e Markdown",
+        "tt_svuota": "Svuota i riquadri e riazzera il canale",
+        "tt_cartella": "Sceglie la cartella progetto e carica i file supportati (max 40)",
+        "tt_add": "Aggiunge documenti o immagini come allegati",
+        "tt_opzioni": "Gestione clienti e modelli",
+        "tt_agenti": "Squadra di ricerca: agenti, confidenza e log (profilo Ricerca)",
     },
     "en": {
         "titolo": "TRILogos — three-voice dialogue (supervisor · LLM1 · LLM2 · LLM3)",
         "supervisore": "SUPERVISOR",
-        "placeholder": "Type your question and press Enter or ▶",
+        "placeholder": "Choose the folder for your project and write your prompt here",
         "invia": "▶ Send",
         "completo": "▶ Run (full)",
         "dibattito": "💬 Debate",
@@ -367,6 +416,7 @@ TESTI = {
         "univoca": "✍️ Unanimous",
         "salva": "💾 Save",
         "svuota": "🗑 Clear",
+        "interrompi": "⏹ Stop",
         "llm1": "LLM1",
         "llm2": "LLM2",
         "llm3": "LLM3",
@@ -382,15 +432,37 @@ TESTI = {
         "sint_ok": "summary and unanimous answer …",
         "fine_ok": "unanimous shared answer ready",
         "opzioni": "⚙ Options",
-        "cartella": "📁 Folder",
+        "cartella": "📁 Project",
         "add": "➕ ADD",
+        "agenti": "🔎 Agents",
         "cross": "🛡 Cross-check",
         "correggi": "✏️ Fix",
+        "crono_attesa": "waiting",
+        "crono_passo": "step",
+        "crono_totale": "total",
+        "tt_lingua": "Language of the interface and model responses",
+        "tt_profilo": "Active profile: {v}",
+        "tt_modello": "Model for {n}: {v}\n'(slow)' models on CPU may take 2-5 minutes per answer",
+        "tt_progetto": "Project folder: {p}",
+        "tt_progetto_non": "Project folder: (not selected)",
+        "tt_invia": "Sends the question to the channel",
+        "tt_completo": "Runs the full 6-step flow",
+        "tt_dibattito": "Runs only the debate between the voices",
+        "tt_sintesi": "Runs summary, work split and unanimous answer",
+        "tt_univoca": "Runs only the unanimous answer",
+        "tt_cross": "Runs the verifier's cross-check",
+        "tt_correggi": "Fixes the answer following the verifier's points (max 3 runs)",
+        "tt_salva": "Saves the session as JSON and Markdown",
+        "tt_svuota": "Clears the panels and resets the channel",
+        "tt_cartella": "Chooses the project folder and loads supported files (max 40)",
+        "tt_add": "Adds documents or images as attachments",
+        "tt_agenti": "Research team: agents, confidence and log (Ricerca profile)",
+        "tt_opzioni": "Manage clients and models",
     },
     "fr": {
         "titolo": "TRILogos — dialogue à trois voix (superviseur · LLM1 · LLM2 · LLM3)",
         "supervisore": "SUPERVISEUR",
-        "placeholder": "Écrivez la question et appuyez sur Entrée ou ▶",
+        "placeholder": "Choisis le dossier de ton projet et écris ton prompt ici",
         "invia": "▶ Envoyer",
         "completo": "▶ Lancer (complet)",
         "dibattito": "💬 Débat",
@@ -398,6 +470,7 @@ TESTI = {
         "univoca": "✍️ Unanime",
         "salva": "💾 Sauvegarder",
         "svuota": "🗑 Vider",
+        "interrompi": "⏹ Interrompre",
         "llm1": "LLM1",
         "llm2": "LLM2",
         "llm3": "LLM3",
@@ -413,15 +486,35 @@ TESTI = {
         "sint_ok": "synthèse et réponse unanime …",
         "fine_ok": "réponse unanime partagée prête",
         "opzioni": "⚙ Options",
-        "cartella": "📁 Dossier",
+        "cartella": "📁 Projet",
         "add": "➕ AJOUTER",
         "cross": "🛡 Vérification",
         "correggi": "✏️ Corriger",
+        "crono_attesa": "en attente",
+        "crono_passo": "étape",
+        "crono_totale": "total",
+        "tt_lingua": "Langue de l'interface et des réponses des modèles",
+        "tt_profilo": "Profil actif : {v}",
+        "tt_modello": "Modèle de {n} : {v}\nLes modèles « (lent) » sur CPU peuvent demander 2-5 minutes par réponse",
+        "tt_progetto": "Dossier du projet : {p}",
+        "tt_progetto_non": "Dossier du projet : (non choisi)",
+        "tt_invia": "Envoie la question au canal",
+        "tt_completo": "Exécute le flux complet en 6 étapes",
+        "tt_dibattito": "Exécute uniquement le débat entre les voix",
+        "tt_sintesi": "Exécute synthèse, répartition et réponse unanime",
+        "tt_univoca": "Exécute uniquement la réponse unanime",
+        "tt_cross": "Exécute la vérification du vérificateur",
+        "tt_correggi": "Corrige la réponse selon les points du vérificateur (max 3 tours)",
+        "tt_salva": "Enregistre la session en JSON et Markdown",
+        "tt_svuota": "Vide les panneaux et réinitialise le canal",
+        "tt_cartella": "Choisit le dossier du projet et charge les fichiers pris en charge (max 40)",
+        "tt_add": "Ajoute des documents ou images comme pièces jointes",
+        "tt_opzioni": "Gestion des clients et des modèles",
     },
     "es": {
         "titolo": "TRILogos — diálogo a tres voces (supervisor · LLM1 · LLM2 · LLM3)",
         "supervisore": "SUPERVISOR",
-        "placeholder": "Escribe la pregunta y pulsa Intro o ▶",
+        "placeholder": "Elige la carpeta para tu proyecto y escribe aquí tu prompt",
         "invia": "▶ Enviar",
         "completo": "▶ Ejecutar (completo)",
         "dibattito": "💬 Debate",
@@ -429,6 +522,7 @@ TESTI = {
         "univoca": "✍️ Unánime",
         "salva": "💾 Guardar",
         "svuota": "🗑 Vaciar",
+        "interrompi": "⏹ Interrumpir",
         "llm1": "LLM1",
         "llm2": "LLM2",
         "llm3": "LLM3",
@@ -444,15 +538,35 @@ TESTI = {
         "sint_ok": "resumen y respuesta unánime …",
         "fine_ok": "respuesta unánime compartida lista",
         "opzioni": "⚙ Opciones",
-        "cartella": "📁 Carpeta",
+        "cartella": "📁 Proyecto",
         "add": "➕ AÑADIR",
         "cross": "🛡 Verificación",
         "correggi": "✏️ Corregir",
+        "crono_attesa": "en espera",
+        "crono_passo": "paso",
+        "crono_totale": "total",
+        "tt_lingua": "Idioma de la interfaz y de las respuestas de los modelos",
+        "tt_profilo": "Perfil activo: {v}",
+        "tt_modello": "Modelo de {n}: {v}\nLos modelos '(lento)' en CPU pueden tardar 2-5 minutos por respuesta",
+        "tt_progetto": "Carpeta del proyecto: {p}",
+        "tt_progetto_non": "Carpeta del proyecto: (no elegida)",
+        "tt_invia": "Envía la pregunta al canal",
+        "tt_completo": "Ejecuta el flujo completo de 6 pasos",
+        "tt_dibattito": "Ejecuta solo el debate entre las voces",
+        "tt_sintesi": "Ejecuta resumen, reparto y respuesta unánime",
+        "tt_univoca": "Ejecuta solo la respuesta unánime",
+        "tt_cross": "Ejecuta la verificación del verificador",
+        "tt_correggi": "Corrige la respuesta siguiendo los puntos del verificador (máx. 3 rondas)",
+        "tt_salva": "Guarda la sesión en JSON y Markdown",
+        "tt_svuota": "Vacía los paneles y reinicia el canal",
+        "tt_cartella": "Elige la carpeta del proyecto y carga los archivos admitidos (máx. 40)",
+        "tt_add": "Añade documentos o imágenes como adjuntos",
+        "tt_opzioni": "Gestión de clientes y modelos",
     },
     "de": {
         "titolo": "TRILogos — Dialog mit drei Stimmen (Betreuer · LLM1 · LLM2 · LLM3)",
         "supervisore": "SUPERVISOR",
-        "placeholder": "Frage eingeben und Enter oder ▶ drücken",
+        "placeholder": "Wähle den Ordner für dein Projekt und schreibe hier deinen Prompt",
         "invia": "▶ Senden",
         "completo": "▶ Komplett",
         "dibattito": "💬 Debatte",
@@ -460,6 +574,7 @@ TESTI = {
         "univoca": "✍️ Einstimmig",
         "salva": "💾 Speichern",
         "svuota": "🗑 Leeren",
+        "interrompi": "⏹ Stoppen",
         "llm1": "LLM1",
         "llm2": "LLM2",
         "llm3": "LLM3",
@@ -475,15 +590,35 @@ TESTI = {
         "sint_ok": "Zusammenfassung und einstimmige Antwort …",
         "fine_ok": "gemeinsame einstimmige Antwort bereit",
         "opzioni": "⚙ Optionen",
-        "cartella": "📁 Ordner",
+        "cartella": "📁 Projekt",
         "add": "➕ HINZUFÜGEN",
         "cross": "🛡 Prüfung",
         "correggi": "✏️ Korrigieren",
+        "crono_attesa": "in Wartestellung",
+        "crono_passo": "Schritt",
+        "crono_totale": "gesamt",
+        "tt_lingua": "Sprache der Oberfläche und der Modellantworten",
+        "tt_profilo": "Aktives Profil: {v}",
+        "tt_modello": "Modell für {n}: {v}\n'(langsam)'-Modelle auf CPU können 2-5 Minuten pro Antwort brauchen",
+        "tt_progetto": "Projektordner: {p}",
+        "tt_progetto_non": "Projektordner: (nicht gewählt)",
+        "tt_invia": "Sendet die Frage an den Kanal",
+        "tt_completo": "Führt den kompletten 6-Schritte-Ablauf aus",
+        "tt_dibattito": "Führt nur die Debatte zwischen den Stimmen aus",
+        "tt_sintesi": "Führt Zusammenfassung, Aufteilung und einstimmige Antwort aus",
+        "tt_univoca": "Führt nur die einstimmige Antwort aus",
+        "tt_cross": "Führt den Cross-Check des Prüfers aus",
+        "tt_correggi": "Korrigiert die Antwort nach den Punkten des Prüfers (max. 3 Runden)",
+        "tt_salva": "Speichert die Sitzung als JSON und Markdown",
+        "tt_svuota": "Leert die Felder und setzt den Kanal zurück",
+        "tt_cartella": "Wählt den Projektordner und lädt unterstützte Dateien (max. 40)",
+        "tt_add": "Fügt Dokumente oder Bilder als Anhänge hinzu",
+        "tt_opzioni": "Verwaltung von Clients und Modellen",
     },
     "pt": {
         "titolo": "TRILogos — diálogo a três vozes (supervisor · LLM1 · LLM2 · LLM3)",
         "supervisore": "SUPERVISOR",
-        "placeholder": "Escreva a pergunta e pressione Enter ou ▶",
+        "placeholder": "Escolhe a pasta para o teu projeto e escreve aqui o teu prompt",
         "invia": "▶ Enviar",
         "completo": "▶ Executar (completo)",
         "dibattito": "💬 Debate",
@@ -491,6 +626,7 @@ TESTI = {
         "univoca": "✍️ Unânime",
         "salva": "💾 Salvar",
         "svuota": "🗑 Limpar",
+        "interrompi": "⏹ Interromper",
         "llm1": "LLM1",
         "llm2": "LLM2",
         "llm3": "LLM3",
@@ -506,15 +642,35 @@ TESTI = {
         "sint_ok": "resumo e resposta unânime …",
         "fine_ok": "resposta unânime compartilhada pronta",
         "opzioni": "⚙ Opções",
-        "cartella": "📁 Pasta",
+        "cartella": "📁 Projeto",
         "add": "➕ ADICIONAR",
         "cross": "🛡 Verificação",
         "correggi": "✏️ Corrigir",
+        "crono_attesa": "em espera",
+        "crono_passo": "passo",
+        "crono_totale": "total",
+        "tt_lingua": "Idioma da interface e das respostas dos modelos",
+        "tt_profilo": "Perfil ativo: {v}",
+        "tt_modello": "Modelo de {n}: {v}\nModelos '(lento)' na CPU podem demorar 2-5 minutos por resposta",
+        "tt_progetto": "Pasta do projeto: {p}",
+        "tt_progetto_non": "Pasta do projeto: (não escolhida)",
+        "tt_invia": "Envia a pergunta ao canal",
+        "tt_completo": "Executa o fluxo completo de 6 passos",
+        "tt_dibattito": "Executa apenas o debate entre as vozes",
+        "tt_sintesi": "Executa resumo, divisão e resposta unânime",
+        "tt_univoca": "Executa apenas a resposta unânime",
+        "tt_cross": "Executa a verificação do verificador",
+        "tt_correggi": "Corrige a resposta seguindo os pontos do verificador (máx. 3 rondas)",
+        "tt_salva": "Salva a sessão em JSON e Markdown",
+        "tt_svuota": "Limpa os painéis e reinicia o canal",
+        "tt_cartella": "Escolhe a pasta do projeto e carrega os arquivos suportados (máx. 40)",
+        "tt_add": "Adiciona documentos ou imagens como anexos",
+        "tt_opzioni": "Gestão de clientes e modelos",
     },
     "zh": {
         "titolo": "TRILogos — 三方对话（主管 · LLM1 · LLM2 · LLM3）",
         "supervisore": "主管",
-        "placeholder": "输入问题并按回车或 ▶",
+        "placeholder": "为你的项目选择文件夹，并在此处输入你的提示词",
         "invia": "▶ 发送",
         "completo": "▶ 运行（完整）",
         "dibattito": "💬 辩论",
@@ -522,6 +678,7 @@ TESTI = {
         "univoca": "✍️ 一致",
         "salva": "💾 保存",
         "svuota": "🗑 清空",
+        "interrompi": "⏹ 中断",
         "llm1": "LLM1",
         "llm2": "LLM2",
         "llm3": "LLM3",
@@ -537,33 +694,220 @@ TESTI = {
         "sint_ok": "总结与一致回答 …",
         "fine_ok": "一致回答已就绪",
         "opzioni": "⚙ 选项",
-        "cartella": "📁 文件夹",
+        "cartella": "📁 项目",
         "add": "➕ 添加",
         "cross": "🛡 核查",
         "correggi": "✏️ 修正",
+        "crono_attesa": "等待中",
+        "crono_passo": "步骤",
+        "crono_totale": "总计",
+        "tt_lingua": "界面和模型回复的语言",
+        "tt_profilo": "当前配置：{v}",
+        "tt_modello": "{n} 的模型：{v}\nCPU 上的“(慢)”模型每次回复可能需要 2-5 分钟",
+        "tt_progetto": "项目文件夹：{p}",
+        "tt_progetto_non": "项目文件夹：（未选择）",
+        "tt_invia": "将问题发送到频道",
+        "tt_completo": "运行完整的 6 步流程",
+        "tt_dibattito": "仅运行各方之间的辩论",
+        "tt_sintesi": "运行总结、分工和一致回答",
+        "tt_univoca": "仅运行一致回答",
+        "tt_cross": "运行验证者的交叉检查",
+        "tt_correggi": "根据验证者的要点修正回答（最多 3 轮）",
+        "tt_salva": "将会话保存为 JSON 和 Markdown",
+        "tt_svuota": "清空面板并重置频道",
+        "tt_cartella": "选择项目文件夹并加载支持的文件（最多 40 个）",
+        "tt_add": "添加文档或图片作为附件",
+        "tt_opzioni": "管理客户端和模型",
     },
 }
 
+# B2e: stringhe del motore interno (IT/EN complete; le altre lingue -> EN).
+_MOTORE_TESTI = {
+    "it": {
+        "motore_tag": "motore",
+        "motore_titolo": "Primo avvio — Motore interno",
+        "motore_hw": "Hardware rilevato",
+        "motore_attesa": "Rilevamento hardware in corso…",
+        "motore_proposti": "Modelli consigliati per il tuo hardware",
+        "motore_licenza": "Licenza: {l}",
+        "motore_scarica": "⬇ Scarica",
+        "motore_riprendi": "⬇ Riprendi",
+        "motore_annulla": "⏹ Annulla",
+        "motore_scaricando": "Download in corso…",
+        "motore_interrotto": "Download interrotto: riprenderà da qui",
+        "motore_pronto": "Pronto: {n} modello/i nel menu dei modelli",
+        "motore_piu_tardi": "Più tardi",
+        "motore_apri": "🤖 Avvio guidato motore",
+        "motore_stato": "⚙ motore: {n} · {lc}",
+        "motore_ok": "llama.cpp ok",
+        "motore_assente": "llama.cpp assente",
+        "motore_errore": "Errore: {e}",
+        "pul_pulsante": "🧹 Pulisci hardware",
+        "pul_titolo": "Pulisci hardware — modalità pulita",
+        "pul_spiega": "Processi che occupano VRAM/RAM. Seleziona e chiudi con "
+                      "conferma: i dati non salvati andranno persi.",
+        "pul_nd": "n/d",
+        "pul_protetto": "protetto",
+        "pul_guadagno": "Guadagno stimato: {mib} MiB",
+        "pul_aggiorna": "🔄 Aggiorna",
+        "pul_chiudi_sel": "🧹 Chiudi selezionati",
+        "pul_annulla": "✖ Annulla",
+        "pul_nessuno_sel": "Nessun processo selezionato",
+        "pul_nessun_proc": "Nessun processo rilevato",
+        "pul_conferma_titolo": "Conferma chiusura",
+        "pul_conferma": "Chiudere {n} processi?\nI dati non salvati andranno "
+                        "persi.\nL'operazione non è reversibile.",
+        "pul_esito": "Chiusi: {n} · non terminano: {k} · protetti: {p}",
+        "pul_guadagno_reale": "VRAM libera: {prima} → {dopo} MiB "
+                              "(guadagno reale {delta} MiB)",
+        "pul_pulsante_breve": "🧹 Pulisci HW",
+        "cat_nome": "Nome", "cat_dim": "Dim.", "cat_fascia": "Fascia",
+        "cat_input": "Input", "cat_output": "Output", "cat_licenza": "Licenza",
+        "cat_scarica_sel": "⬇ Scarica selezionati",
+        "cat_annulla_coda": "⏹ Annulla coda",
+        "cat_installato": "installato ✓", "cat_in_uso": "in uso",
+        "cat_nessuna_sel": "Nessun modello selezionato",
+        "cat_coda": "Coda: {i}/{n} · {file}",
+        "cat_consigliato": "consigliato",
+    },
+    "en": {
+        "motore_tag": "engine",
+        "motore_titolo": "First run — Internal engine",
+        "motore_hw": "Detected hardware",
+        "motore_attesa": "Detecting hardware…",
+        "motore_proposti": "Recommended models for your hardware",
+        "motore_licenza": "License: {l}",
+        "motore_scarica": "⬇ Download",
+        "motore_riprendi": "⬇ Resume",
+        "motore_annulla": "⏹ Cancel",
+        "motore_scaricando": "Downloading…",
+        "motore_interrotto": "Download interrupted: it will resume from here",
+        "motore_pronto": "Ready: {n} model(s) in the model menu",
+        "motore_piu_tardi": "Later",
+        "motore_apri": "🤖 Engine guided setup",
+        "motore_stato": "⚙ engine: {n} · {lc}",
+        "motore_ok": "llama.cpp ok",
+        "motore_assente": "llama.cpp missing",
+        "motore_errore": "Error: {e}",
+        "pul_pulsante": "🧹 Clean hardware",
+        "pul_titolo": "Clean hardware — clean mode",
+        "pul_spiega": "Processes using VRAM/RAM. Select and close with "
+                      "confirmation: unsaved data will be lost.",
+        "pul_nd": "n/a",
+        "pul_protetto": "protected",
+        "pul_guadagno": "Estimated gain: {mib} MiB",
+        "pul_aggiorna": "🔄 Refresh",
+        "pul_chiudi_sel": "🧹 Close selected",
+        "pul_annulla": "✖ Cancel",
+        "pul_nessuno_sel": "No process selected",
+        "pul_nessun_proc": "No process detected",
+        "pul_conferma_titolo": "Confirm close",
+        "pul_conferma": "Close {n} processes?\nUnsaved data will be lost.\n"
+                        "This operation cannot be undone.",
+        "pul_esito": "Closed: {n} · not terminating: {k} · protected: {p}",
+        "pul_guadagno_reale": "Free VRAM: {prima} → {dopo} MiB "
+                              "(real gain {delta} MiB)",
+        "pul_pulsante_breve": "🧹 Clean HW",
+        "cat_nome": "Name", "cat_dim": "Size", "cat_fascia": "Tier",
+        "cat_input": "Input", "cat_output": "Output", "cat_licenza": "License",
+        "cat_scarica_sel": "⬇ Download selected",
+        "cat_annulla_coda": "⏹ Cancel queue",
+        "cat_installato": "installed ✓", "cat_in_uso": "in use",
+        "cat_nessuna_sel": "No model selected",
+        "cat_coda": "Queue: {i}/{n} · {file}",
+        "cat_consigliato": "recommended",
+    },
+}
+for _lingua_testi in TESTI:
+    TESTI[_lingua_testi].update(_MOTORE_TESTI.get(_lingua_testi, _MOTORE_TESTI["en"]))
 
-def costruisci_canale(lingua="it", profilo=None, voce_c=None, clienti=None):
+
+def _timeout_rete():
+    """Timeout di rete (connect, read) da config.json → rete, validati: due
+    interi > 0. Ritorna (tupla, avviso|None): se la sezione è presente ma non
+    valida, usa i default TIMEOUT_RETE (10, 120) e restituisce il messaggio di
+    avviso da mostrare nello stato. Il core non legge mai la config: i valori
+    arrivano ai modelli solo per parametro esplicito."""
+    rete = CONFIG.get("rete")
+    if rete is None:
+        return TIMEOUT_RETE, None
+    try:
+        c, r = int(rete.get("timeout_connect")), int(rete.get("timeout_read"))
+        if c > 0 and r > 0:
+            return (c, r), None
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return TIMEOUT_RETE, "config.json → rete non valida: uso i timeout predefiniti (10, 120)"
+
+
+def _autore_timeline():
+    """Author per la timeline da config.json → timeline.author (dict) o None:
+    il core applica il default neutro AUTORE_NEUTRO (A10a). Mai dati personali
+    hardcoded: chi vuole firma la timeline nel proprio config."""
+    autore = (CONFIG.get("timeline") or {}).get("author")
+    return autore if isinstance(autore, dict) else None
+
+
+def _keep_alive_ollama():
+    """V3: keep_alive per Ollama da config.json → ollama.keep_alive (default -1)."""
+    valore = (CONFIG.get("ollama") or {}).get("keep_alive", -1)
+    return valore if valore is not None else -1
+
+
+def _num_ctx_ollama():
+    """FIX CRITICO: contesto per Ollama da config.json → ollama.num_ctx
+    (default 8192; il default del modello R1 è 131072 -> 35 GB e thrashing)."""
+    try:
+        valore = int((CONFIG.get("ollama") or {}).get("num_ctx", 8192))
+    except (TypeError, ValueError):
+        valore = 8192
+    return valore if valore > 0 else 8192
+
+
+def _kw_modello(cfg, timeout, keep_alive):
+    """Kwargs per crea_modello da config: `keep_alive` e `num_ctx` solo per
+    Ollama (gli altri adapter non li accettano). `num_ctx` per-voce
+    (modelli.<A|B|C>.num_ctx) se presente, altrimenti il globale."""
+    kw = dict(modello=cfg.get("modello"), timeout=timeout)
+    if cfg.get("tipo") == "ollama":
+        kw["keep_alive"] = keep_alive
+        try:
+            num_ctx = int(cfg.get("num_ctx")) if cfg.get("num_ctx") is not None else None
+        except (TypeError, ValueError):
+            num_ctx = None
+        kw["num_ctx"] = num_ctx if num_ctx and num_ctx > 0 else _num_ctx_ollama()
+    return kw
+
+
+def costruisci_canale(lingua="it", profilo=None, voce_c=None, clienti=None, timeout=None):
     """Canale completo: A e B da config; la terza voce C dalla combo di c_c
     (voce_c + modello_da_voce) se l'API del Canale la supporta; soglie da
     config.json (canale.soglie) se presenti. Fase intermedia (canale senza C):
-    comportamento invariato a due voci."""
+    comportamento invariato a due voci. `timeout`: (connect, read) per i modelli
+    di rete; None -> letto/validato da config.json → rete (helper _timeout_rete).
+    V1/V2/V3: dibattito parallelo, limiti token e keep_alive da config.json."""
     m = CONFIG["modelli"]
-    a = crea_modello(m["A"]["tipo"], modello=m["A"].get("modello"))
-    b = crea_modello(m["B"]["tipo"], modello=m["B"].get("modello"))
+    timeout = timeout or _timeout_rete()[0]
+    keep_alive = _keep_alive_ollama()
+    num_ctx = _num_ctx_ollama()
+    a = crea_modello(m["A"]["tipo"], **_kw_modello(m["A"], timeout, keep_alive))
+    b = crea_modello(m["B"]["tipo"], **_kw_modello(m["B"], timeout, keep_alive))
     profilo = profilo or next(iter(CONFIG["profili"]))
     ruoli = CONFIG["profili"].get(profilo) or next(iter(CONFIG["profili"].values()))
     kwargs = dict(ruolo_a=ruoli["A"], ruolo_b=ruoli["B"],
                   max_turni_dibattito=CONFIG["canale"]["max_turni_dibattito"],
                   soglia_convergenza=CONFIG["canale"]["soglia_convergenza"],
-                  lingua=lingua, max_chiamate=CONFIG["canale"].get("max_chiamate", 40))
+                  lingua=lingua, max_chiamate=CONFIG["canale"].get("max_chiamate", 40),
+                  stile=ruoli.get("stile") or "",
+                  formato_risposta=ruoli.get("formato_risposta") or "semplice",
+                  dibattito_parallelo=CONFIG["canale"].get("dibattito_parallelo", True),
+                  limiti_token=CONFIG["canale"].get("limiti_token"))
     if SUPPORTA_C:
         if voce_c:
-            c = modello_da_voce(voce_c, clienti)
+            c = modello_da_voce(voce_c, clienti, timeout=timeout,
+                                keep_alive=keep_alive, num_ctx=num_ctx)
         elif "C" in m:
-            c = crea_modello(m["C"]["tipo"], modello=m["C"].get("modello"))
+            c = crea_modello(m["C"]["tipo"], **_kw_modello(m["C"], timeout, keep_alive))
         else:
             c = None
         kwargs[_PARAM_C] = c
@@ -576,11 +920,11 @@ def costruisci_canale(lingua="it", profilo=None, voce_c=None, clienti=None):
 
 class _RiquadroFinale:
     """Zona C (risposta univoca): header colorato + box, con request compatto
-    (il box è a 4 righe richieste: il pannello 142px lo espande a tutto il resto)."""
+    (il box è a 4 righe richieste: il pannello 284px lo espande a tutto il resto)."""
     def __init__(self, master, polo, colore, descrizione):
         header = tk.Frame(master, bg=PALETTE["pannello"])
         header.pack(fill="x", padx=1, pady=(1, 0))
-        self.polo = Pill(header, testo=f"  {polo}  ")
+        self.polo = Pill(header, testo=f"  {polo}  ", colore=colore)
         self.polo.pack(side="left")
         self.lbl_modello = tk.Label(header, text=descrizione, bg=PALETTE["pannello"],
                                     fg=PALETTE["secondario"], font=("Segoe UI", 9))
@@ -588,16 +932,30 @@ class _RiquadroFinale:
         self.boxwrap = BoxArrotondato(master, altezza_righe=4)
         self.box = self.boxwrap.box
         self.boxwrap.pack(fill="both", expand=True, padx=1, pady=(0, 1))
-        self.box.configure(state="disabled")
 
     def descrizione(self, testo):
         self.lbl_modello.configure(text=testo)
 
     def scrivi(self, testo):
-        self.box.configure(state="normal")
         self.box.insert("end", testo + "\n\n")
-        self.box.configure(state="disabled")
         self.box.see("end")
+        self._evidenzia_etichette()
+
+    def _evidenzia_etichette(self):
+        """A11 rev. 7: le etichette RISPOSTA:/FORMULA: della zona C sono rese in
+        grassetto (tag del tk.Text); nessun widget nuovo, copiabilità invariata."""
+        try:
+            self.box.tag_configure("etichetta_finale", font=("Consolas", 10, "bold"))
+            for etichetta in ("RISPOSTA:", "FORMULA:"):
+                pos = "1.0"
+                while True:
+                    pos = self.box.search(etichetta, pos, stopindex="end")
+                    if not pos:
+                        break
+                    self.box.tag_add("etichetta_finale", pos, f"{pos}+{len(etichetta)}c")
+                    pos = f"{pos}+{len(etichetta)}c"
+        except tk.TclError:
+            pass
 
 
 PLACEHOLDER_CHIAVE = "incolla qui la chiave"
@@ -1198,16 +1556,618 @@ class SplashByok(tk.Toplevel):
         self.destroy()
 
 
+class FinestraAvvioGuidato(tk.Toplevel):
+    """B2e — Primo avvio guidato del motore interno (non bloccante).
+    Passi: (a) rileva hardware (Profiler B2a); (b) propone i modelli per fascia
+    (downloader.per_fascia + 0.5B) con nome, dimensione e licenza; (c) scarica
+    con progresso (byte/totali/%, velocita'; Annulla -> parziale conservato per
+    la ripresa); (d) pronto: i modelli compaiono nei menu. Chiudibile in ogni
+    momento con 'Più tardi'; un download in corso viene annullato (parziale
+    conservato). Stringhe nella lingua attiva della finestra principale."""
+
+    def __init__(self, master, cartella=None):
+        super().__init__(master)
+        self.app = master
+        self._cartella = cartella or _motore.cartella_modelli()
+        self._annulla = False
+        self._voce_in_corso = None
+        self._righe = {}
+        self._check_catalogo = {}
+        self._coda_attiva = False
+        self._annulla_coda = False
+        self._profilo = None
+        self.title("TRILogos — " + self._t("motore_titolo"))
+        self.geometry("700x640")
+        self.configure(bg=PALETTE["sfondo"])
+        self.transient(master)
+        self.protocol("WM_DELETE_WINDOW", self._chiudi)
+        self._costruisci()
+        threading.Thread(target=self._lavoro_hw, daemon=True).start()
+
+    def _t(self, chiave):
+        return TESTI[self.app.lingua][chiave]
+
+    # ---- costruzione ----
+    def _costruisci(self):
+        header = tk.Frame(self, bg=PALETTE["sfondo"])
+        header.pack(fill="x", padx=12, pady=(12, 4))
+        Pill(header, testo="  TRILogos  ").pack(side="left")
+        tk.Label(header, text=self._t("motore_titolo"), bg=PALETTE["sfondo"],
+                 fg=PALETTE["ambra"], font=FONT_H).pack(side="left", padx=10)
+        self._lbl_hw = tk.Label(self, text=self._t("motore_attesa"), bg=PALETTE["sfondo"],
+                                fg=PALETTE["secondario"], font=("Segoe UI", 10),
+                                anchor="w", justify="left")
+        self._lbl_hw.pack(fill="x", padx=14, pady=(2, 6))
+        # B2g: modalita' pulita PRIMA delle proposte modelli (proposta + misura)
+        barra_pul = tk.Frame(self, bg=PALETTE["sfondo"])
+        barra_pul.pack(fill="x", padx=14, pady=(0, 4))
+        PulsanteRotondo(barra_pul, testo=self._t("pul_pulsante"),
+                        comando=self._apri_pulizia).pack(side="left")
+        self._lbl_pul = tk.Label(barra_pul, text="", bg=PALETTE["sfondo"],
+                                 fg=PALETTE["verde"], font=("Segoe UI", 9))
+        self._lbl_pul.pack(side="left", padx=8)
+        tk.Label(self, text=self._t("motore_proposti"), bg=PALETTE["sfondo"],
+                 fg=PALETTE["testo"], font=FONT_B, anchor="w").pack(fill="x", padx=14)
+        self._corpo = tk.Frame(self, bg=PALETTE["sfondo"])
+        self._corpo.pack(fill="both", expand=True, padx=14, pady=4)
+        # download: stato + barra + annulla
+        self._lbl_prog = tk.Label(self, text="", bg=PALETTE["sfondo"],
+                                  fg=PALETTE["ambra"], font=("Consolas", 9),
+                                  anchor="w", justify="left")
+        self._lbl_prog.pack(fill="x", padx=14)
+        self._barra = tk.Canvas(self, height=14, bg=PALETTE["campo"],
+                                highlightthickness=0, bd=0)
+        self._barra.pack(fill="x", padx=14, pady=(2, 4))
+        self._barra_pieno = self._barra.create_rectangle(
+            0, 0, 0, 14, fill=PALETTE["ambra"], outline="")
+        self._lbl_pronto = tk.Label(self, text="", bg=PALETTE["sfondo"],
+                                    fg=PALETTE["verde"], font=("Segoe UI", 10, "bold"),
+                                    anchor="w", justify="left")
+        self._lbl_pronto.pack(fill="x", padx=14)
+        fondo = tk.Frame(self, bg=PALETTE["sfondo"])
+        fondo.pack(fill="x", padx=12, pady=(6, 10), side="bottom")
+        self._btn_coda = PulsanteRotondo(fondo, testo=self._t("cat_scarica_sel"),
+                                         comando=self._avvia_coda)
+        self._btn_coda.pack(side="left")
+        self._btn_annulla_coda = PulsanteRotondo(fondo, testo=self._t("cat_annulla_coda"),
+                                                 comando=self._ferma_coda)
+        self._btn_annulla_coda.pack(side="left", padx=8)
+        self._btn_annulla_coda.pack_forget()
+        PulsanteRotondo(fondo, testo=self._t("motore_piu_tardi"),
+                        comando=self._chiudi).pack(side="right")
+
+    def _lavoro_hw(self):
+        """Profiler in background: mai bloccare la UI."""
+        try:
+            profilo = _profiler.rileva()
+        except Exception as e:
+            self.app._ui(self._mostra_errore, str(e))
+            return
+        self.app._ui(self._mostra_hw, profilo)
+
+    def _mostra_hw(self, profilo):
+        parti = []
+        if profilo.gpu_nome:
+            parti.append(f"{profilo.gpu_nome} · {profilo.vram_totale_mib} MiB VRAM "
+                         f"({profilo.vram_libera_mib} liberi)")
+        else:
+            parti.append("GPU: nessuna (solo CPU)")
+        parti.append(f"RAM {profilo.ram_totale_gb} GB ({profilo.ram_libera_gb} liberi)")
+        parti.append(f"CPU {profilo.cpu_core} core / {profilo.cpu_thread} thread")
+        testo = self._t("motore_hw") + ": " + " · ".join(parti)
+        if profilo.avvisi:
+            testo += "\n" + " · ".join(profilo.avvisi)
+        self._lbl_hw.configure(text=testo)
+        self._proponi(profilo)
+
+    def _apri_pulizia(self):
+        """B2g: apre la modalita' pulita; a fine pulizia aggiorna hardware,
+        guadagno reale e proposte modelli (ricalcolo per_fascia)."""
+        FinestraPulizia(self.app, al_termine=self._pulizia_fatta)
+
+    def _pulizia_fatta(self, profilo):
+        """Callback a fine pulizia: profilo ri-rilevato dal Profiler."""
+        self._mostra_hw(profilo)
+        if getattr(profilo, "vram_libera_mib", None) is not None:
+            self._lbl_pul.configure(
+                text=f"{profilo.vram_libera_mib} MiB VRAM liberi")
+
+    def _proponi(self, profilo):
+        """B2d/B2e rev.: catalogo con checkbox multi-selezione e colonne
+        nome/dimensione/fascia/input/output/licenza; stato installato
+        persistente e badge 'in uso'. La spunta serve SOLO al download:
+        l'attivazione resta nei menu A/B/C."""
+        self._profilo = profilo
+        for figlio in self._corpo.winfo_children():
+            figlio.destroy()
+        self._check_catalogo.clear()
+        self._righe.clear()
+        try:
+            consigliate = {v.chiave for v in _downloader.per_fascia(profilo)}
+            voci = list(_downloader.catalogo())
+        except Exception as e:
+            self._mostra_errore(str(e))
+            return
+        larghezze = (26, 9, 18, 12, 8, 16)
+        intest = tk.Frame(self._corpo, bg=PALETTE["sfondo"])
+        intest.pack(fill="x")
+        for testo, larghezza in zip(
+                (self._t("cat_nome"), self._t("cat_dim"), self._t("cat_fascia"),
+                 self._t("cat_input"), self._t("cat_output"), self._t("cat_licenza")),
+                larghezze):
+            tk.Label(intest, text=testo, bg=PALETTE["sfondo"],
+                     fg=PALETTE["secondario"], font=("Segoe UI", 8, "bold"),
+                     width=larghezza, anchor="w").pack(side="left")
+        for v in voci:
+            riga = tk.Frame(self._corpo, bg=PALETTE["pannello"])
+            riga.pack(fill="x", pady=1)
+            installato = self._installato(v)
+            var = tk.BooleanVar(value=False)
+            casella = tk.Checkbutton(
+                riga, text="", variable=var,
+                state="disabled" if installato else "normal",
+                bg=PALETTE["pannello"], activebackground=PALETTE["pannello"],
+                selectcolor=PALETTE["campo"], highlightthickness=0)
+            casella.pack(side="left", padx=2)
+            self._check_catalogo[v.chiave] = var
+            nome = v.nome + (" ★" if v.chiave in consigliate else "")
+            dim = f"{v.dimensione_gb:.2f} GB" + (" +mmproj" if v.mmproj_url else "")
+            for testo, larghezza in zip(
+                    (nome, dim, v.fascia, ", ".join(v.input), ", ".join(v.output),
+                     v.licenza), larghezze):
+                tk.Label(riga, text=testo, bg=PALETTE["pannello"], fg=PALETTE["testo"],
+                         font=("Segoe UI", 8), width=larghezza,
+                         anchor="w").pack(side="left")
+            stato = tk.Label(riga, text="", bg=PALETTE["pannello"],
+                             font=("Segoe UI", 8, "bold"))
+            stato.pack(side="left", padx=2)
+            if installato:
+                stato.configure(text=self._t("cat_installato"), fg=PALETTE["verde"])
+            if self._in_uso(v):
+                prefisso = (stato.cget("text") + " · ") if stato.cget("text") else ""
+                stato.configure(text=prefisso + self._t("cat_in_uso"),
+                                fg=PALETTE["ambra"])
+            self._righe[v.chiave] = riga
+
+    def _installato(self, v):
+        """Installato persistente: file completo per dimensione (+ mmproj per i
+        vision). Veloce: nessun checksum di GB a ogni apertura."""
+        percorso = os.path.join(self._cartella,
+                                _downloader.nome_file_sanificato(v.nome_file))
+        if not (os.path.isfile(percorso)
+                and os.path.getsize(percorso) == v.dimensione_byte):
+            return False
+        if v.mmproj_url:
+            mmproj = os.path.join(self._cartella,
+                                  _downloader.nome_file_sanificato(v.mmproj_file))
+            if not (os.path.isfile(mmproj)
+                    and os.path.getsize(mmproj) == v.mmproj_byte):
+                return False
+        return True
+
+    def _in_uso(self, v):
+        """Badge 'in uso': il file è selezionato in A/B/C del canale."""
+        percorso = os.path.join(self._cartella,
+                                _downloader.nome_file_sanificato(v.nome_file))
+        for polo in ("A", "B", "C"):
+            modello = getattr(self.app.canale, polo, None)
+            if isinstance(modello, _motore.ModelloMotore) \
+                    and modello.percorso == percorso:
+                return True
+        return False
+
+    # ---- coda di download (uno alla volta, parziali conservati) ----
+    def _avvia_coda(self):
+        if self._coda_attiva:
+            return
+        scelte = []
+        for chiave, var in self._check_catalogo.items():
+            if not var.get():
+                continue
+            try:
+                v = _downloader.voce(chiave)
+            except _downloader.ErroreDownload:
+                continue
+            if not self._installato(v):
+                scelte.append(v)
+        if not scelte:
+            self._lbl_prog.configure(text=self._t("cat_nessuna_sel"))
+            return
+        self._coda_attiva = True
+        self._annulla_coda = False
+        self._btn_annulla_coda.pack(side="left", padx=8)
+        threading.Thread(target=self._lavoro_coda, args=(scelte,),
+                         daemon=True).start()
+
+    def _lavoro_coda(self, voci):
+        totale = len(voci)
+        for indice, v in enumerate(voci, start=1):
+            self.app._ui(self._coda_voce, indice, totale, v)
+            try:
+                _downloader.scarica(v, self._cartella, self._callback_progresso)
+            except _downloader.InterrompiDownload:
+                self.app._ui(self._coda_interrotta)
+                return
+            except Exception as e:
+                self.app._ui(self._coda_errore, str(e))
+                return
+        self.app._ui(self._coda_fine)
+
+    def _callback_progresso(self, campione):
+        if self._annulla_coda:
+            raise _downloader.InterrompiDownload()
+        self.app._ui(self._mostra_progresso, campione)
+
+    def _coda_voce(self, indice, totale, v):
+        self._lbl_prog.configure(
+            text=self._t("cat_coda").format(i=indice, n=totale, file=v.nome_file))
+
+    def _mostra_progresso(self, campione):
+        if campione["fase"] == "verifica":
+            self._lbl_prog.configure(text="verifica checksum…")
+            return
+        if campione["fase"] == "completato":
+            return
+        mb = campione["byte"] / 1e6
+        tot = (campione["totale"] or 0) / 1e6
+        perc = campione["percentuale"] or 0
+        nome_file = campione.get("file") or ""
+        self._lbl_prog.configure(
+            text=f"{nome_file} · {mb:.1f}/{tot:.1f} MB · {perc:.1f}% · "
+                 f"{campione['velocita_mb_s']:.1f} MB/s")
+        lar = max(1, self._barra.winfo_width())
+        self._barra.coords(self._barra_pieno, 0, 0, int(lar * perc / 100), 14)
+
+    def _ferma_coda(self):
+        self._annulla_coda = True
+        self._lbl_prog.configure(text=self._t("motore_interrotto"))
+
+    def _coda_interrotta(self):
+        self._coda_attiva = False
+        self._btn_annulla_coda.pack_forget()
+        self._lbl_prog.configure(text=self._t("motore_interrotto"))
+        if self._profilo is not None:
+            self._proponi(self._profilo)
+
+    def _coda_errore(self, messaggio):
+        self._coda_attiva = False
+        self._btn_annulla_coda.pack_forget()
+        self._lbl_prog.configure(text=self._t("motore_errore").format(e=messaggio))
+
+    def _coda_fine(self):
+        self._coda_attiva = False
+        self._btn_annulla_coda.pack_forget()
+        self._barra.coords(self._barra_pieno, 0, 0, self._barra.winfo_width(), 14)
+        self.app._aggiorna_voci_modelli()
+        n = len(_motore.modelli_locali())
+        self._lbl_pronto.configure(text=self._t("motore_pronto").format(n=n))
+        if self._profilo is not None:
+            self._proponi(self._profilo)
+
+    def _mostra_errore(self, messaggio):
+        self._lbl_prog.configure(text=self._t("motore_errore").format(e=messaggio))
+
+    def _chiudi(self):
+        if self._coda_attiva:
+            self._annulla_coda = True  # il parziale resta per la ripresa
+        self.destroy()
+
+
+class FinestraPulizia(tk.Toplevel):
+    """B2g — Modalita' pulita "🧹 Pulisci hardware": processi che occupano
+    VRAM/RAM con guadagno stimato, selezione a checkbox, conferma esplicita
+    ("i dati non salvati andranno persi"), chiusura gentile dei soli PID
+    selezionati, ri-misura del guadagno reale e ricalcolo delle proposte.
+    Mai chiusura automatica; i processi protetti (sistema/python) non sono
+    selezionabili."""
+
+    def __init__(self, master, al_termine=None):
+        super().__init__(master)
+        self.app = master
+        self.al_termine = al_termine
+        self._checkbox = {}   # pid -> BooleanVar
+        self._voci = {}       # pid -> voce
+        self.title("TRILogos — " + TESTI[master.lingua]["pul_titolo"])
+        self.geometry("720x620")
+        self.configure(bg=PALETTE["sfondo"])
+        self.transient(master)
+        self._costruisci()
+        self._aggiorna()
+
+    def _t(self, chiave):
+        return TESTI[self.app.lingua][chiave]
+
+    def _costruisci(self):
+        header = tk.Frame(self, bg=PALETTE["sfondo"])
+        header.pack(fill="x", padx=12, pady=(12, 2))
+        Pill(header, testo="  TRILogos  ").pack(side="left")
+        tk.Label(header, text=self._t("pul_titolo"), bg=PALETTE["sfondo"],
+                 fg=PALETTE["ambra"], font=FONT_H).pack(side="left", padx=10)
+        tk.Label(self, text=self._t("pul_spiega"), bg=PALETTE["sfondo"],
+                 fg=PALETTE["secondario"], font=("Segoe UI", 9),
+                 anchor="w", justify="left", wraplength=680).pack(fill="x", padx=14)
+        # P1-B (collaudo B2rev): lista processi in canvas scrollabile, cosi' i
+        # pulsanti inferiori restano sempre raggiungibili con molte righe.
+        self._canvas_corpo = tk.Canvas(self, bg=PALETTE["sfondo"],
+                                       highlightthickness=0)
+        self._sb_corpo = tk.Scrollbar(self, orient="vertical",
+                                      command=self._canvas_corpo.yview)
+        self._canvas_corpo.configure(yscrollcommand=self._sb_corpo.set)
+        self._sb_corpo.pack(side="right", fill="y", padx=(0, 4))
+        self._canvas_corpo.pack(side="top", fill="both", expand=True,
+                                padx=(14, 0), pady=6)
+        self._corpo = tk.Frame(self._canvas_corpo, bg=PALETTE["sfondo"])
+        self._win_corpo = self._canvas_corpo.create_window(
+            (0, 0), window=self._corpo, anchor="nw")
+        self._corpo.bind(
+            "<Configure>",
+            lambda e: self._canvas_corpo.configure(
+                scrollregion=self._canvas_corpo.bbox("all")))
+        self._canvas_corpo.bind(
+            "<Configure>",
+            lambda e: self._canvas_corpo.itemconfigure(
+                self._win_corpo, width=e.width))
+        self._canvas_corpo.bind(
+            "<MouseWheel>",
+            lambda e: self._canvas_corpo.yview_scroll(
+                -1 if e.delta > 0 else 1, "units"))
+        self._lbl_guadagno = tk.Label(self, text="", bg=PALETTE["sfondo"],
+                                      fg=PALETTE["ambra"], font=FONT_B, anchor="w")
+        self._lbl_guadagno.pack(fill="x", padx=14)
+        self._lbl_esito = tk.Label(self, text="", bg=PALETTE["sfondo"],
+                                   fg=PALETTE["verde"], font=("Segoe UI", 9),
+                                   anchor="w", justify="left", wraplength=680)
+        self._lbl_esito.pack(fill="x", padx=14)
+        self._lbl_reale = tk.Label(self, text="", bg=PALETTE["sfondo"],
+                                   fg=PALETTE["ambra"], font=FONT_B,
+                                   anchor="w", justify="left", wraplength=680)
+        self._lbl_reale.pack(fill="x", padx=14)
+        fondo = tk.Frame(self, bg=PALETTE["sfondo"])
+        fondo.pack(fill="x", padx=12, pady=(6, 10), side="bottom")
+        PulsanteRotondo(fondo, testo=self._t("pul_aggiorna"),
+                        comando=self._aggiorna).pack(side="left")
+        PulsanteRotondo(fondo, testo=self._t("pul_chiudi_sel"),
+                        comando=self._chiudi_selezionati).pack(side="left", padx=8)
+        PulsanteRotondo(fondo, testo=self._t("pul_annulla"),
+                        comando=self.destroy).pack(side="right")
+
+    # ---- analisi ----
+    def _aggiorna(self):
+        for figlio in self._corpo.winfo_children():
+            figlio.destroy()
+        self._checkbox.clear()
+        self._voci.clear()
+        self._lbl_esito.configure(text="")
+        self._lbl_reale.configure(text="")
+        threading.Thread(target=self._lavoro_analizza, daemon=True).start()
+
+    def _lavoro_analizza(self):
+        dati = _pulizia.analizza()
+        self.app._ui(self._mostra, dati)
+
+    def _mostra(self, dati):
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        if not dati["processi"]:
+            tk.Label(self._corpo, text=self._t("pul_nessun_proc"),
+                     bg=PALETTE["sfondo"], fg=PALETTE["secondario"],
+                     font=("Segoe UI", 9)).pack(anchor="w")
+            return
+        for voce in dati["processi"]:
+            self._voci[voce["pid"]] = voce
+            riga = tk.Frame(self._corpo, bg=PALETTE["pannello"])
+            riga.pack(fill="x", pady=1)
+            var = tk.BooleanVar(value=False)
+            if voce["protetto"]:
+                casella = tk.Checkbutton(
+                    riga, text="", variable=var, state="disabled",
+                    bg=PALETTE["pannello"], activebackground=PALETTE["pannello"],
+                    selectcolor=PALETTE["campo"], highlightthickness=0)
+            else:
+                casella = tk.Checkbutton(
+                    riga, text="", variable=var, command=self._aggiorna_guadagno,
+                    bg=PALETTE["pannello"], activebackground=PALETTE["pannello"],
+                    selectcolor=PALETTE["campo"], highlightthickness=0)
+            casella.pack(side="left", padx=4)
+            self._checkbox[voce["pid"]] = var
+            vram = (f"{voce['vram_mib']} MiB" if voce["vram_mib"] is not None
+                    else self._t("pul_nd"))
+            ram = (f"{voce['ram_mib']} MiB" if voce["ram_mib"] is not None
+                   else self._t("pul_nd"))
+            testo = (f"{voce['nome']} (PID {voce['pid']}) · VRAM {vram} · RAM {ram}")
+            if voce["protetto"]:
+                testo += f" · {self._t('pul_protetto')}: {voce['motivo']}"
+            lbl = tk.Label(riga, text=testo, bg=PALETTE["pannello"], fg=PALETTE["testo"],
+                           font=("Segoe UI", 9), anchor="w", justify="left")
+            lbl.pack(side="left", fill="x", expand=True, padx=6, pady=3)
+            # P4-3: la rotella sopra le righe deve scorrere la lista
+            for w in (riga, casella, lbl):
+                w.bind("<MouseWheel>", self._wheel_corpo)
+        self._aggiorna_guadagno()
+
+    def _wheel_corpo(self, e):
+        """P4-3: scroll della lista processi con la rotella."""
+        self._canvas_corpo.yview_scroll(-1 if e.delta > 0 else 1, "units")
+        return "break"
+
+    def _aggiorna_guadagno(self):
+        totale = 0
+        for pid, var in self._checkbox.items():
+            voce = self._voci.get(pid)
+            if var.get() and voce is not None:
+                totale += voce["guadagno_mib"]
+        self._lbl_guadagno.configure(
+            text=self._t("pul_guadagno").format(mib=totale))
+
+    # ---- chiusura con conferma ----
+    def _chiudi_selezionati(self):
+        selezionati = [pid for pid, var in self._checkbox.items()
+                       if var.get() and not self._voci.get(pid, {}).get("protetto")]
+        if not selezionati:
+            self._lbl_esito.configure(text=self._t("pul_nessuno_sel"))
+            return
+        from tkinter import messagebox
+        conferma = messagebox.askyesno(
+            self._t("pul_conferma_titolo"),
+            self._t("pul_conferma").format(n=len(selezionati)),
+            parent=self)
+        if not conferma:
+            return  # annulla: nessuna chiusura
+        self._lbl_esito.configure(text="…")
+        threading.Thread(target=self._lavoro_chiudi, args=(selezionati,),
+                         daemon=True).start()
+
+    def _lavoro_chiudi(self, pid_list):
+        prima = _profiler.rileva()
+        esiti = _pulizia.chiudi(pid_list)
+        time.sleep(1.0)  # il driver aggiorna la VRAM dopo la chiusura
+        profilo = _profiler.rileva()
+        self.app._ui(self._dopo_chiusura, esiti, prima, profilo)
+
+    def _dopo_chiusura(self, esiti, prima, profilo):
+        chiusi = sum(1 for e in esiti if e["esito"] == "chiuso")
+        non_term = sum(1 for e in esiti if e["esito"] == "non termina")
+        protetti = sum(1 for e in esiti if e["esito"] == "protetto")
+        self._aggiorna()  # ricarica la lista (reset sincrono delle label)
+        self._lbl_esito.configure(
+            text=self._t("pul_esito").format(n=chiusi, k=non_term, p=protetti))
+        if prima.vram_libera_mib is not None and profilo.vram_libera_mib is not None:
+            delta = profilo.vram_libera_mib - prima.vram_libera_mib
+            self._lbl_reale.configure(
+                text=self._t("pul_guadagno_reale").format(
+                    prima=prima.vram_libera_mib, dopo=profilo.vram_libera_mib,
+                    delta=delta))
+        if self.al_termine is not None:
+            try:
+                self.al_termine(profilo)
+            except Exception:
+                pass
+
+
+class FinestraAgenti(tk.Toplevel):
+    """B3 — Squadra di ricerca: agenti creati, confidenza per iterazione e log.
+    Testi readonly selezionabili e copiabili (requisito A8); aggiornamenti in
+    tempo reale via evento() chiamato dal main thread (coda UI)."""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.app = master
+        self.title("TRILogos — Squadra di ricerca")
+        self.geometry("620x520")
+        self.configure(bg=PALETTE["sfondo"])
+        self.transient(master)
+        header = tk.Frame(self, bg=PALETTE["sfondo"])
+        header.pack(fill="x", padx=12, pady=(12, 2))
+        Pill(header, testo="  TRILogos  ").pack(side="left")
+        tk.Label(header, text="Squadra di ricerca", bg=PALETTE["sfondo"],
+                 fg=PALETTE["ambra"], font=FONT_H).pack(side="left", padx=10)
+        self._aree = {}
+        self._area("Agenti", 6)
+        self._area("Confidenza", 5)
+        self._area("Log", 7)
+        self._scrivi(self._aree["Log"],
+                     "Nessuna ricerca in corso. Attiva il profilo Ricerca e premi "
+                     "▶ Avvia (completo): qui vedrai agenti, confidenza e log in "
+                     "tempo reale.")
+        fondo = tk.Frame(self, bg=PALETTE["sfondo"])
+        fondo.pack(fill="x", padx=12, pady=(6, 10), side="bottom")
+        PulsanteRotondo(fondo, testo="✖ Chiudi", comando=self.destroy).pack(side="right")
+
+    def _area(self, titolo, righe):
+        tk.Label(self, text=titolo, bg=PALETTE["sfondo"], fg=PALETTE["secondario"],
+                 font=FONT_B, anchor="w").pack(fill="x", padx=14, pady=(6, 0))
+        t = tk.Text(self, height=righe, bg=PALETTE["campo"], fg=PALETTE["testo"],
+                    wrap="word", font=("Consolas", 9), relief="flat",
+                    insertwidth=0, highlightthickness=0)
+        t.pack(fill="both", expand=True, padx=14)
+        t.bind("<Key>", lambda e: "break")  # sola lettura: digitazione bloccata
+        menu = tk.Menu(t, tearoff=0)
+        menu.add_command(label="Copia", command=lambda: self._copia(t))
+        menu.add_command(label="Seleziona tutto",
+                         command=lambda: (t.tag_add("sel", "1.0", "end"),
+                                          t.focus_set()))
+        t.bind("<Button-3>", lambda e: menu.tk_popup(e.x_root, e.y_root))
+        self._aree[titolo] = t
+        return t
+
+    def _copia(self, t):
+        try:
+            testo = t.get("sel.first", "sel.last")
+        except tk.TclError:
+            testo = t.get("1.0", "end")
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(testo)
+        except tk.TclError:
+            pass
+
+    def _scrivi(self, area, testo):
+        try:
+            area.insert("end", testo + "\n")
+            area.see("end")
+        except tk.TclError:
+            pass
+
+    def pulisci(self):
+        """P4-5: svuota le tre aree (chiamata da Svuota)."""
+        for area in self._aree.values():
+            try:
+                area.delete("1.0", "end")
+            except tk.TclError:
+                pass
+
+    def evento(self, tipo, dati):
+        """Aggiornamenti in tempo reale (main thread)."""
+        if tipo == "piano" and dati.get("piano"):
+            for ag in dati["piano"].get("agenti", []):
+                self._scrivi(self._aree["Agenti"],
+                             f"• {ag.get('nome')} — {ag.get('specialita')}: "
+                             f"{ag.get('obiettivo')}")
+        elif tipo == "agente":
+            self._scrivi(self._aree["Log"],
+                         f"[{dati.get('stato')}] {dati.get('nome')} "
+                         f"{dati.get('esito', '')}")
+        elif tipo == "iterazione":
+            vals = " · ".join(f"{v['voce']}:{v['punteggio']:.2f}"
+                              for v in dati.get("valutazioni", []))
+            self._scrivi(self._aree["Confidenza"],
+                         f"Iterazione {dati.get('numero')}: confidenza "
+                         f"{dati.get('confidenza', 0):.2f}/10 ({vals})")
+        elif tipo == "fase":
+            self._scrivi(self._aree["Log"], f"— {dati.get('nome')} —")
+        elif tipo == "avviso":
+            self._scrivi(self._aree["Log"], f"⚠ {dati.get('testo', '')}")
+        elif tipo == "salvato":
+            self._scrivi(self._aree["Log"], f"salvato: {dati.get('percorso', '')}")
+
+
 class TrilogoApp(Finestra):
     def __init__(self):
-        super().__init__(f"{TESTI['it']['titolo']}  ·  v{VERSIONE}")
+        # Finestra 1200×862: +142px in altezza per la zona C doppia (284px).
+        super().__init__(f"{TESTI['it']['titolo']}  ·  v{VERSIONE}",
+                         larghezza=1200, altezza=862)
+        # Riferimento all'header interno (label est di LabGUI) per la lingua (F4-E)
+        self._lbl_titolo_est = None
+        for _w in self.est.winfo_children():
+            if isinstance(_w, ttk.Label):
+                self._lbl_titolo_est = _w
+                break
+        # Migrazione una tantum dei flag runtime da config.json a stato.json
+        # (file locale gitignored): PRIMA di leggere splash e primo flusso.
+        _stato.migra_da_config(CONFIG)
         self.lingua = "it"
         self._ultima_domanda = ""
-        self.clienti = rileva_clienti()
-        self.opzioni = _opzioni_etichettate(voci_modelli(self.clienti))
-        self.canale = costruisci_canale(self.lingua,
-                                        voce_c=self.opzioni[0] if self.opzioni else None,
-                                        clienti=self.clienti)
+        # Clienti BASE senza rete: la prima finestra appare subito; il
+        # rilevamento completo gira in un thread e aggiorna i menu a fine probe.
+        self.clienti = clienti_base()
+        self.opzioni = self._voci_menu()
+        # Voce C dalla config (voce_c=None): mai "mock" implicito all'avvio.
+        _timeout, _avviso_timeout = _timeout_rete()
+        self.canale = costruisci_canale(self.lingua, voce_c=None,
+                                        clienti=self.clienti, timeout=_timeout)
         self.dibattito_risultato = None
         self._busy = False
         self._messaggio_finale = None
@@ -1216,9 +2176,21 @@ class TrilogoApp(Finestra):
         self.ultimo_punti = ""
         self._rigiri = 0
         self._profilo_attivo = next(iter(CONFIG["profili"]))
+        self._preset_attivo = False
+        # A12: True mentre "Svuota" è mostrato come "Interrompi" (elaborazione)
+        self._interrompi_attivo = False
         self._chiusa = False
+        # V6: warmup in background dei soli modelli lenti (uno grande alla volta).
+        self._warmup = {}           # nome modello -> "in_corso"|"pronto"|"fallito"
+        self._warmup_thread = None  # thread del warmup attivo (attesa del flusso)
+        # Status bar COMPOSTA (F5-A): messaggio di stato + cronometro. Il
+        # cronometro vive qui: la banda SUPERVISORE è stata rimossa dalla zona A.
+        self._stato_testo = ""
+        self._stato_colore = PALETTE["secondario"]
         self._crono = {"passo": None, "durata": None, "totale": None}
         self._costruisci()
+        if _avviso_timeout:
+            self.stato(_avviso_timeout)
         try:
             _percorso_ico = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icona_trilogos.ico")
             self.iconbitmap(bitmap=_percorso_ico)
@@ -1228,32 +2200,251 @@ class TrilogoApp(Finestra):
         self._coda_ui = queue.Queue()
         self.after(50, self._sonda_ui)
         self._applica_lingua()
+        if _AVVISO_PROFILI_LEGACY:
+            self.stato(_AVVISO_PROFILI_LEGACY)
+        self._init_perimetro()
         self.spinner = self._spinner_localizzato
         self.bind("<Escape>", lambda e: self._annulla())
         self.protocol("WM_DELETE_WINDOW", self._chiusura)
-        # SPLASH BYOK al primo avvio (flag byok_splash assente in config.json):
+        # SPLASH BYOK al primo avvio (flag byok_splash assente in stato.json):
         # Toplevel non bloccante, la finestra principale resta operativa.
         # NESSUN focus_force né topmost: il Toplevel appare sopra la principale
         # da solo, senza rubare il focus ai click dell'utente (e ai test GUI).
-        self._splash = SplashByok(self) if not CONFIG.get("byok_splash") else None
+        self._splash = SplashByok(self) if not _stato.leggi().get("byok_splash") else None
+        # Rilevamento clienti in background: a fine probe il risultato torna sul
+        # main thread via coda UI (_applica_clienti_rilevati), mai tk da thread
+        # non-main; errore -> messaggio di stato, mai crash.
+        threading.Thread(target=self._rileva_clienti_bg, daemon=True).start()
+        # V6: warmup automatico all'avvio (dopo il primo render; non blocca la UI).
+        self.after(300, self._avvia_warmup)
+        # B2e: primo avvio guidato se il motore interno non ha modelli.
+        self.after(800, self._avvio_guidato_se_serve)
+
+    def _rileva_clienti_bg(self):
+        """Probe dei clienti (rete) FUORI dal thread UI: la finestra è già
+        visibile e reattiva. Il risultato (o l'errore) viene accodato sul main
+        thread con _ui."""
+        try:
+            clienti = rileva_clienti()
+        except Exception as e:
+            self._ui(self.stato, f"rilevamento clienti non riuscito: {e}")
+            return
+        self._ui(self._applica_clienti, clienti)
+
+    def _applica_clienti(self, clienti):
+        """Aggiorna clienti/opzioni, i values delle tre combo e riallinea le
+        selezioni al canale (fonte di verità) via _voce_canale: un eventuale
+        cambio modello dell'utente è preservato. Gira sul main thread (via _ui)."""
+        self.clienti = clienti
+        self.opzioni = self._voci_menu()
+        for combo in (self.c_a.combo, self.c_b.combo, self.c_c.combo):
+            combo.configure(values=self.opzioni)
+        self.c_a.combo.set(self._voce_canale(self.canale.A))
+        self.c_b.combo.set(self._voce_canale(self.canale.B))
+        c_terzo = getattr(self.canale, "C", None)
+        if c_terzo is not None:
+            self.c_c.combo.set(self._voce_canale(c_terzo))
 
     def _spinner_localizzato(self, attivo=True):
-        testo = "● in elaborazione …" if attivo else TESTI[self.lingua]["pronto"]
-        self._status.configure(text=testo, fg=PALETTE["ambra"] if attivo else PALETTE["secondario"])
+        """Spinner localizzato: passa dal metodo stato() COMPOSTO, così il
+        cronometro resta visibile nella status bar anche durante l'attesa."""
+        self.stato("in elaborazione …" if attivo else TESTI[self.lingua]["pronto"],
+                   PALETTE["ambra"] if attivo else None)
+
+    def stato(self, testo, colore=None):
+        """Status bar COMPOSTA (F5-A): messaggio di stato e cronometro condividono
+        la stessa riga in basso ('messaggio · ⏱ passo · passo Xs · totale Ys').
+        Sovrascrive Finestra.stato: ogni scrittura ricompone la riga intera."""
+        self._stato_testo = testo
+        self._stato_colore = colore or PALETTE["secondario"]
+        self._aggiorna_status()
+
+    def _aggiorna_status(self):
+        """Ricompone la status bar. Gira sul main thread (o via _ui dai worker):
+        tk non è thread-safe."""
+        crono = self._componi_crono()
+        testo = f"{self._stato_testo}  ·  {crono}" if self._stato_testo else crono
+        try:
+            self._status.configure(text=testo, fg=self._stato_colore)
+        except tk.TclError:
+            pass
+        # P1-A (collaudo F4): il configure del Label padre perde il paint dei
+        # figli place(): riposizionali a ogni scrittura di stato (ri-place
+        # immediato = restano sempre visibili, nessun lampeggio).
+        self._riposiziona_status()
+
+    def _componi_crono(self):
+        """Testo del cronometro per la status bar, NELLA LINGUA ATTIVA (F4-E):
+        a riposo '⏱ 0.0s · in attesa'; in corso '⏱ passo'; a passo finito
+        '⏱ passo · passo Xs · totale Ys'. Nessun troncamento."""
+        c = self._crono
+        t = TESTI[self.lingua]
+        if c.get("passo") is None:
+            return f"⏱ 0.0s · {t['crono_attesa']}"
+        if c.get("durata") is None:
+            return f"⏱ {c['passo']}"
+        return (f"⏱ {c['passo']} · {t['crono_passo']} {c['durata']:.1f}s"
+                f" · {t['crono_totale']} {c['totale']:.1f}s")
+
+    def _aggiorna_perimetro_ui(self):
+        """Segmento DESTRO della status bar (A9): cartella progetto fissa +
+        (B2e) stato del motore interno: '📁 progetto: X · ⚙ motore: N · llama.cpp ok'."""
+        nome = perimetro.nome()
+        testo = f"📁 progetto: {nome}" if nome else "📁 progetto: (non scelta)"
+        testo += f"  ·  {self._stato_motore()}"
+        try:
+            self._lbl_perimetro.configure(text=testo)
+        except tk.TclError:
+            pass
+
+    def _riposiziona_status(self):
+        """P1-A (collaudo B2rev): forza il ridisegno dei widget place() della
+        status bar (cartella progetto + Pulisci HW) quando la barra ottiene la
+        larghezza reale: al primo render possono non disegnarsi."""
+        for w, x in ((self._lbl_perimetro, -104), (self._btn_pul_status, -6)):
+            try:
+                w.place_configure(relx=1.0, rely=1.0, anchor="se", x=x, y=-4)
+                w.lift()
+            except tk.TclError:
+                pass
+
+    def _stato_motore(self):
+        """B2e: indicatore del motore interno per la status bar."""
+        n = len(_motore.modelli_locali())
+        lc = (TESTI[self.lingua]["motore_ok"] if _motore.llama_disponibile()
+              else TESTI[self.lingua]["motore_assente"])
+        return TESTI[self.lingua]["motore_stato"].format(n=n, lc=lc)
+
+    def _voci_menu(self):
+        """Voci dei menu modelli: client esterni (con etichetta di lentezza) +
+        (B2e) modelli del motore interno, nella lingua attiva."""
+        voci = _opzioni_etichettate(voci_modelli(self.clienti), self.lingua)
+        tag = TESTI[self.lingua]["motore_tag"]
+        voci += [_motore.nome_voce(percorso, tag)
+                 for percorso, _nome in _motore.modelli_locali()]
+        return voci
+
+    def _aggiorna_voci_modelli(self):
+        """B2e: ricalcola le voci e le applica alle tre combo (dopo un download)."""
+        self.opzioni = self._voci_menu()
+        for combo in (self.c_a.combo, self.c_b.combo, self.c_c.combo):
+            try:
+                combo.configure(values=self.opzioni)
+            except tk.TclError:
+                pass
+        self._aggiorna_perimetro_ui()
+
+    def _avvio_guidato_se_serve(self):
+        """B2e: mostra la guidata all'avvio quando il motore interno non ha
+        modelli (non blocca la UI; una sola finestra per volta)."""
+        if self._chiusa:
+            return
+        if _motore.modelli_locali():
+            return
+        self._apri_avvio_guidato()
+
+    def _apri_avvio_guidato(self):
+        """B2e: apre (o riporta in primo piano) la finestra guidata del motore."""
+        guidata = getattr(self, "_guidata", None)
+        if guidata is not None:
+            try:
+                if guidata.winfo_exists():
+                    guidata.lift()
+                    return
+            except tk.TclError:
+                pass
+        self._guidata = FinestraAvvioGuidato(self)
+
+    def _apri_pulizia_hw(self):
+        """B2g: modalita' pulita anche da Opzioni/status bar; a fine pulizia
+        aggiorna stato motore e status bar (nessun ricalcolo proposte)."""
+        fin = getattr(self, "_pulizia_fin", None)
+        if fin is not None:
+            try:
+                if fin.winfo_exists():
+                    fin.lift()
+                    return
+            except tk.TclError:
+                pass
+        self._pulizia_fin = FinestraPulizia(
+            self, al_termine=lambda profilo: self._aggiorna_perimetro_ui())
+
+    def _garanzia_motore(self):
+        """B2f: se il canale usa voci del motore interno ma llama.cpp non è
+        disponibile o un modello è sparito, avvisa e riporta il canale ai
+        client esterni (nessuna rottura del flusso). True se il canale è ok."""
+        voci = []
+        for polo in ("A", "B", "C"):
+            modello = getattr(self.canale, polo, None)
+            if isinstance(modello, _motore.ModelloMotore):
+                voci.append((polo, modello))
+        if not voci:
+            return True
+        problemi = []
+        if not _motore.llama_disponibile():
+            problemi.append("llama.cpp assente")
+        for polo, modello in voci:
+            if not os.path.isfile(modello.percorso):
+                problemi.append(f"{polo}: modello mancante "
+                                f"({os.path.basename(modello.percorso)})")
+        if not problemi:
+            return True
+        avviso = ("⚠ motore interno non disponibile (" + "; ".join(problemi)
+                  + "): il flusso usa i client esterni")
+        self.stato(avviso)
+        self._ricostruisci_canale_esterno(avviso)
+        return False
+
+    def _ricostruisci_canale_esterno(self, avviso=""):
+        """B2f: canale dai modelli di config (client esterni), profilo/lingua
+        invariati; l'avviso resta visibile in zona C."""
+        try:
+            self.canale = costruisci_canale(
+                self.lingua, profilo=self._profilo_attivo, voce_c=None,
+                clienti=self.clienti, timeout=_timeout_rete()[0])
+        except Exception as e:
+            self.stato(f"ERRORE fallback client esterni: {e}")
+            return
+        self.dibattito_risultato = None
+        self._svuota()
+        self.c_a.combo.set(self._voce_canale(self.canale.A))
+        self.c_b.combo.set(self._voce_canale(self.canale.B))
+        c_terzo = getattr(self.canale, "C", None)
+        if c_terzo is not None:
+            self.c_c.combo.set(self._voce_canale(c_terzo))
+        if avviso:
+            self.c_finale.scrivi(avviso)
+
+    def _tooltip_progetto(self):
+        """Testo del tooltip del pulsante 📁 (localizzato, F4-E): percorso completo."""
+        t = TESTI[self.lingua]
+        percorso = perimetro.leggi()
+        return t["tt_progetto"].format(p=percorso) if percorso else t["tt_progetto_non"]
+
+    def _init_perimetro(self):
+        """All'avvio: avvisa se la cartella salvata non esiste più e aggiorna il
+        segmento destro della status bar."""
+        salvata = _stato.leggi().get(perimetro.CHIAVE)
+        if salvata and perimetro.leggi() is None:
+            self.stato("⚠ cartella progetto non più esistente: scegline una con 📁 Progetto")
+        self._aggiorna_perimetro_ui()
 
     def _annulla(self):
         if self._busy:
-            self.canale.annulla = True
+            # FIX: annullamento immediato (chiude anche le response HTTP in attesa)
+            self.canale.annulla_tutto()
             self.stato("⏹ annullamento in corso …")
 
     def _chiusura(self):
         if self._busy:
             from tkinter import messagebox
             if messagebox.askyesno("TRILogos", "Elaborazione in corso: interrompere e chiudere?"):
-                self.canale.annulla = True
+                self.canale.annulla_tutto()
+                _motore.ferma_tutti()  # B2f: nessun llama-server orfano
                 self._chiusa = True
                 self.destroy()
             return
+        _motore.ferma_tutti()  # B2f: stop pulito dei server motore
         self._chiusa = True
         self.destroy()
 
@@ -1263,7 +2454,16 @@ class TrilogoApp(Finestra):
         self.canale.annulla = False
         self._busy = True
         for chiave in self.bottoni:
+            # B3 rev. (N47): "agenti" resta attivo durante la ricerca: il
+            # pannello serve proprio mentre gli agenti lavorano.
+            if chiave == "agenti":
+                continue
             self.bottoni[chiave].configure(state="disabled")
+        # A12: "Svuota" diventa "Interrompi" (stesso posto/larghezza, resta
+        # attivo; comando identico a Esc). A fine lavoro torna "Svuota".
+        self._interrompi_attivo = True
+        self.bottoni["svuota"].configure(text=TESTI[self.lingua]["interrompi"],
+                                         command=self._annulla, state="normal")
         self.spinner(True)
         self.update_idletasks()
         return True
@@ -1271,9 +2471,23 @@ class TrilogoApp(Finestra):
     def _fine_lavoro(self):
         if self._chiusa:
             return
+        # B2f: stop pulito dei server motore a fine flusso (VRAM/RAM liberate)
+        try:
+            _motore.ferma_tutti()
+        except Exception:
+            pass
         self._busy = False
         for chiave in self.bottoni:
             self.bottoni[chiave].configure(state="normal")
+        # A12: il pulsante contestuale torna "Svuota" (testo e comando originali)
+        if getattr(self, "_interrompi_attivo", False):
+            self._interrompi_attivo = False
+            self.bottoni["svuota"].configure(text=TESTI[self.lingua]["svuota"],
+                                             command=self._svuota)
+        if self.canale.annulla:
+            # F4-E: dopo un annullo (Esc) il cronometro torna a riposo
+            self.canale.annulla = False
+            self._reset_cronometro()
         if self._messaggio_finale:
             self.stato(self._messaggio_finale)
             self._messaggio_finale = None
@@ -1282,24 +2496,23 @@ class TrilogoApp(Finestra):
 
     def _costruisci(self):
         # LAYOUT TRIVOICE: zona A (barra SUPERVISORE 84px) + zona B (riga 4 riquadri 420px)
-        # + zona C (risposta univoca 142px); totali: 84 + 420 + 142 + 12 (pady) = 658.
+        # + zona C (risposta univoca 284px); totali: 84 + 420 + 284 + 12 (pady) = 800.
         # Dimensioni esatte via minsize delle righe/colonne (i frame con figli
         # non possono forzare la propria size: la richiesta resta quella dei figli).
         self.contenuto.grid_columnconfigure(0, weight=1)
         self.contenuto.grid_rowconfigure(0, weight=0, minsize=88)   # cella 88 = 84 + pady 4
         self.contenuto.grid_rowconfigure(1, weight=1)
-        self.contenuto.grid_rowconfigure(2, weight=0, minsize=146)  # cella 146 = 142 + pady 4
+        self.contenuto.grid_rowconfigure(2, weight=0, minsize=288)  # cella 288 = 284 + pady 4
         self.contenuto.bind("<Configure>", self._adatta_quadri)
 
-        # ZONA A — barra SUPERVISORE (84px, full width, senza pulsanti)
+        # ZONA A — barra SUPERVISORE (84px, full width, senza pulsanti):
+        # banda/pill rimossa (F5-A), il campo di input occupa TUTTO lo spazio;
+        # cronometro e stato del flusso vivono nella status bar in basso.
         self._zona_a = RiquadroRotondo(self.contenuto, bg=PALETTE["sfondo"])
         self._zona_a.grid(row=0, column=0, sticky="nsew", pady=2)
-        self.lbl_supervisore = Pill(self._zona_a.frame, testo="  SUPERVISORE  ")
-        self.lbl_supervisore.pack(fill="x")
-        self._zona_a.frame.bind("<Configure>", self._riadatta_pill)
         self._bw_supervisore = BoxArrotondato(self._zona_a.frame, altezza_righe=3, editabile=True)
         self.supervisore = self._bw_supervisore.box
-        self._bw_supervisore.pack(fill="both", expand=True, padx=2, pady=(0, 2))
+        self._bw_supervisore.pack(fill="both", expand=True, padx=2, pady=2)
 
         self.supervisore.bind("<Return>", self._invio_supervisore)
         self.supervisore.bind("<FocusIn>", self._focus_supervisore)
@@ -1319,7 +2532,7 @@ class TrilogoApp(Finestra):
         # 12 pulsanti in ordine (Correggi dopo Cross-check, prima di Salva).
         # Il contenuto vive su un canvas con scrollbar verticale SOVRAPPOSTA
         # (pattern di BoxArrotondato): visibile SOLO quando la zona B è compressa
-        # (900×600: ~291px disponibili vs ~434px richiesti). A 1200×720 layout
+        # (900×600: ~291px disponibili vs ~434px richiesti). A 1200×862 layout
         # invariato (200×415, nessuna scrollbar).
         self._quadro = RiquadroRotondo(self._zona_b.frame)
         self._quadro.grid(row=0, column=0, sticky="nsew", padx=(1, 2))
@@ -1346,7 +2559,12 @@ class TrilogoApp(Finestra):
         self.combo_profilo.set(next(iter(CONFIG["profili"])))
         self.combo_profilo.combo.bind("<<ComboboxSelected>>", lambda e: self._cambia_profilo())
         self.combo_profilo.pack(side="left", fill="x", expand=True, padx=(1, 0))
+        # tooltip (A5) localizzati (F4-E): seguono la lingua attiva
+        Tooltip(self.combo_lingua, lambda: TESTI[self.lingua]["tt_lingua"])
+        Tooltip(self.combo_profilo,
+                lambda: TESTI[self.lingua]["tt_profilo"].format(v=self.combo_profilo.get()))
         self.bottoni = {}
+        self._tooltips = {}
         for chiave, w, comando in (("invia", 9, self._completo),
                                    ("completo", 15, self._completo),
                                    ("dibattito", 9, self._dibattito),
@@ -1358,16 +2576,24 @@ class TrilogoApp(Finestra):
                                    ("svuota", 9, self._svuota),
                                    ("cartella", 11, self._add_cartella),
                                    ("add", 8, self._add_files),
-                                   ("opzioni", 10, self._opzioni)):
+                                   ("opzioni", 10, self._opzioni),
+                                   ("agenti", 10, self._apri_agenti)):
             b = PulsanteRotondo(self._quadro_interno, width=w, comando=comando)
             b.pack(fill="x", padx=6, pady=1)
             self.bottoni[chiave] = b
+            self._tooltips[chiave] = Tooltip(
+                b, lambda k=chiave: TESTI[self.lingua].get(
+                    "tt_" + k, TESTI["en"].get("tt_" + k, "")))
+        # Tooltip del pulsante Progetto: percorso completo (dinamico, A9)
+        self._tooltips["cartella"].testo = self._tooltip_progetto
 
         # rotella del mouse sul quadro: scroll verticale del canvas (i figli del
         # frame interno sono canvas/combobox: l'evento non risale da solo)
         self._quadro_interno.bind("<Configure>", self._aggiorna_scroll_quadro)
         self._quadro_canvas.bind("<Configure>", self._allarga_quadro)
         self._quadro_canvas.bind("<MouseWheel>", self._wheel_quadro)
+        # P4-1: ricalcolo dopo il primo layout (con 13 pulsanti serve la scrollbar)
+        self.after(400, self._adatta_quadri)
         for w in _discendenti(self._quadro_interno):
             w.bind("<MouseWheel>", self._wheel_quadro)
 
@@ -1392,8 +2618,13 @@ class TrilogoApp(Finestra):
         c_terzo = getattr(self.canale, "C", None)
         if c_terzo is not None:
             self.c_c.combo.set(self._voce_canale(c_terzo))
+        # tooltip (A5) sulle combo modello: valore corrente + nota lentezza (localizzati)
+        for colonna, nome in ((self.c_a, "LLM1"), (self.c_b, "LLM2"), (self.c_c, "LLM3")):
+            Tooltip(colonna.combo,
+                    lambda n=nome, col=colonna: TESTI[self.lingua]["tt_modello"].format(
+                        n=n, v=col.combo.get()))
 
-        # ZONA C — risposta univoca (142px, full width)
+        # ZONA C — risposta univoca (284px, full width)
         self._zona_c = RiquadroRotondo(self.contenuto, bg=PALETTE["sfondo"])
         self._zona_c.grid(row=2, column=0, sticky="nsew", pady=2)
         self.c_finale = _RiquadroFinale(self._zona_c.frame, "RISPOSTA UNIVOCA", PALETTE["viola"],
@@ -1403,10 +2634,29 @@ class TrilogoApp(Finestra):
         for riquadro in (self._zona_a, self._zona_b, self._quadro,
                          self._wr_a, self._wr_b, self._wr_c, self._zona_c):
             riquadro.aggiorna_req()
+        # Status bar a DUE segmenti (A9): a destra la cartella progetto (fissa).
+        # P1-A (collaudo F4, fix definitivo): i figli place() del Label di stato
+        # NON vengono disegnati da Tk su Windows. I due widget vivono quindi come
+        # figli della FINESTRA (root), ancorati in basso a destra dentro la barra.
+        self._lbl_perimetro = tk.Label(self, text="", bg=PALETTE["pannello"],
+                                       fg=PALETTE["secondario"], font=("Segoe UI", 9), padx=6)
+        self._lbl_perimetro.place(relx=1.0, rely=1.0, anchor="se", x=-104, y=-4)
+        # B2g rev.: pulsante compatto "🧹 Pulisci HW" sempre visibile in status bar
+        self._btn_pul_status = tk.Label(
+            self, text=TESTI[self.lingua]["pul_pulsante_breve"],
+            bg=PALETTE["pannello"], fg=PALETTE["ambra"],
+            font=("Segoe UI", 8, "bold"), cursor="hand2", padx=4)
+        self._btn_pul_status.place(relx=1.0, rely=1.0, anchor="se", x=-6, y=-4)
+        self._btn_pul_status.bind("<Button-1>", lambda e: self._apri_pulizia_hw())
+        self._aggiorna_perimetro_ui()
+        # riposizionamento (finestra ridimensionata / primo render)
+        self.bind("<Configure>", lambda e: self._riposiziona_status(), add="+")
+        self.after_idle(self._riposiziona_status)
+        self.after(250, self._riposiziona_status)
 
     def _adatta_quadri(self, e=None):
-        """Regola i minsize della riga dei riquadri: 415px (zona B reale = alt−238,
-        contenuto 653px: 84 + 415 + 142 + 12); sotto soglia i riquadri LLM si
+        """Regola i minsize della riga dei riquadri: 415px (zona B reale = alt−380,
+        contenuto 795px: 84 + 415 + 284 + 12); sotto soglia i riquadri LLM si
         comprimono (nessun 1x1) e il quadro pulsanti diventa scrollabile."""
         lar = self.contenuto.winfo_width()
         alt = self.contenuto.winfo_height()
@@ -1414,22 +2664,29 @@ class TrilogoApp(Finestra):
             return
         if not getattr(self, "_zona_b", None):
             return
-        riga_b = alt - 238  # 84 + 142 + 12 (pady delle 3 zone); tolleranza bordi finestra
+        riga_b = alt - 380  # 84 + 284 + 12 (pady delle 3 zone); tolleranza bordi finestra
         ok = lar >= 1180 and riga_b >= 415
         self._zona_b.frame.grid_rowconfigure(0, weight=1, minsize=415 if ok else 0)
         for i in (1, 2, 3):
             self._zona_b.frame.grid_columnconfigure(i, weight=1, minsize=320 if ok else 0)
         # quadro pulsanti: sempre nsew (a 900×600 resta dentro la zona B, non
-        # esonda più sotto la zona C). A 1200×720 (ok) niente scrollbar e canvas
+        # esonda più sotto la zona C). A 1200×862 (ok) niente scrollbar e canvas
         # all'altezza del contenuto (layout invariato); sotto soglia il canvas
         # si limita allo spazio reale e la scrollbar verticale appare.
         self._quadro.grid_configure(sticky="nsew")
-        if ok:
+        # P4-1 (collaudo F4): con 13 pulsanti il contenuto eccede i 415px anche
+        # a finestra piena: la scrollbar va mostrata quando la richiesta supera
+        # lo spazio reale (non solo sotto soglia finestra).
+        richiesta = self._quadro_interno.winfo_reqheight()
+        if ok and richiesta <= riga_b:
             self._quadro_canvas.itemconfigure(self._quadro_item_sb, state="hidden")
-            self._quadro_canvas.configure(height=self._quadro_interno.winfo_reqheight())
+            self._quadro_canvas.configure(height=richiesta)
         else:
             self._quadro_canvas.itemconfigure(self._quadro_item_sb, state="normal")
             self._quadro_canvas.configure(height=max(riga_b, 120))
+            # P4-1 residuo: restringe il frame interno ora che la scrollbar è
+            # mappata (evita la sovrapposizione traccia/pulsanti).
+            self.after(30, self._allarga_quadro)
 
     # ---- scroll verticale del quadro pulsanti (solo quando lo spazio manca) ----
     def _aggiorna_scroll_quadro(self, e=None):
@@ -1453,7 +2710,7 @@ class TrilogoApp(Finestra):
 
     def _wheel_quadro(self, e):
         """Rotella sul quadro pulsanti: scroll verticale SOLO se la scrollbar è
-        visibile (a 1200×720 niente scroll: layout invariato)."""
+        visibile (a 1200×862 niente scroll: layout invariato)."""
         if not self._quadro_sb.winfo_ismapped():
             return "break"
         self._quadro_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
@@ -1467,11 +2724,62 @@ class TrilogoApp(Finestra):
             return
         nome = self.combo_profilo.get()
         ruoli = CONFIG["profili"].get(nome)
-        if ruoli:
-            self._profilo_attivo = nome
-            self.canale.ruolo_a = ruoli["A"]
-            self.canale.ruolo_b = ruoli["B"]
-            self.stato(f"profilo ruoli: {nome}")
+        if not ruoli:
+            return
+        self._profilo_attivo = nome
+        self.canale.ruolo_a = ruoli["A"]
+        self.canale.ruolo_b = ruoli["B"]
+        # A11: stile e formato del profilo si aggiornano subito
+        self.canale.stile = (ruoli.get("stile") or "").strip()
+        self.canale.formato_risposta = ruoli.get("formato_risposta") or "semplice"
+        # V4: preset "Veloce" — modelli piccoli + max_turni_dibattito dedicati:
+        # ricostruzione del canale. I profili senza `modelli` restano solo-ruoli.
+        preset = ruoli.get("modelli")
+        if preset:
+            try:
+                _timeout = _timeout_rete()[0]
+                _ka = _keep_alive_ollama()
+                _nc = _num_ctx_ollama()
+                a = modello_da_voce(preset.get("A"), self.clienti, timeout=_timeout, keep_alive=_ka, num_ctx=_nc)
+                b = modello_da_voce(preset.get("B"), self.clienti, timeout=_timeout, keep_alive=_ka, num_ctx=_nc)
+                c = (modello_da_voce(preset.get("C"), self.clienti, timeout=_timeout, keep_alive=_ka, num_ctx=_nc)
+                     if preset.get("C") else None)
+                kwargs = dict(ruolo_a=ruoli["A"], ruolo_b=ruoli["B"],
+                              max_turni_dibattito=ruoli.get("max_turni_dibattito",
+                                                            CONFIG["canale"]["max_turni_dibattito"]),
+                              soglia_convergenza=CONFIG["canale"]["soglia_convergenza"],
+                              lingua=self.lingua,
+                              max_chiamate=CONFIG["canale"].get("max_chiamate", 40),
+                              stile=ruoli.get("stile") or "",
+                              formato_risposta=ruoli.get("formato_risposta") or "semplice",
+                              dibattito_parallelo=CONFIG["canale"].get("dibattito_parallelo", True),
+                              limiti_token=CONFIG["canale"].get("limiti_token"))
+                if SUPPORTA_C:
+                    kwargs[_PARAM_C] = c
+                    if "C" in ruoli and _supporta(Canale.__init__, "ruolo_c"):
+                        kwargs["ruolo_c"] = ruoli["C"]
+                if CONFIG["canale"].get("soglie") and SUPPORTA_SOGLIE:
+                    kwargs["soglie"] = CONFIG["canale"]["soglie"]
+                self.canale = Canale(a, b, **kwargs)
+                self.dibattito_risultato = None
+                self._svuota()
+                self.c_a.combo.set(self._voce_canale(self.canale.A))
+                self.c_b.combo.set(self._voce_canale(self.canale.B))
+                c_terzo = getattr(self.canale, "C", None)
+                if c_terzo is not None:
+                    self.c_c.combo.set(self._voce_canale(c_terzo))
+                self._preset_attivo = True
+                _motore.ferma_server_non_usati(self.canale)
+                self._avvia_warmup()
+            except Exception as e:
+                self.stato(f"ERRORE preset '{nome}': {e}")
+                return
+        elif getattr(self, "_preset_attivo", False):
+            # Uscita dal preset: ripristina i turni standard del config (i modelli
+            # restano quelli mostrati nei menu: WYSIWYG).
+            self.canale.max_turni = CONFIG["canale"]["max_turni_dibattito"]
+            self._preset_attivo = False
+        self.stato(f"profilo ruoli: {nome}" + (" (preset Veloce)" if preset else ""))
 
     def _cambia_lingua(self):
         if self._busy:
@@ -1486,18 +2794,37 @@ class TrilogoApp(Finestra):
     def _applica_lingua(self):
         t = TESTI[self.lingua]
         self.title(f"{t['titolo']}  ·  v{VERSIONE}")
-        self._titolo_supervisore = t["supervisore"]
+        if self._lbl_titolo_est is not None:
+            # F4-E: anche l'header interno segue la lingua (non solo il titolo)
+            self._lbl_titolo_est.configure(text=f"{t['titolo']}  ·  v{VERSIONE}")
         self._reset_cronometro()
+        # Menu modelli rigenerati NELLA LINGUA ATTIVA (suffisso di lentezza
+        # tradotto) e selezioni riallineate al canale (fonte di verità).
+        self.opzioni = self._voci_menu()
+        for combo in (self.c_a.combo, self.c_b.combo, self.c_c.combo):
+            combo.configure(values=self.opzioni)
+        self.c_a.combo.set(self._voce_canale(self.canale.A))
+        self.c_b.combo.set(self._voce_canale(self.canale.B))
+        c_terzo = getattr(self.canale, "C", None)
+        if c_terzo is not None:
+            self.c_c.combo.set(self._voce_canale(c_terzo))
         for chiave in ("invia", "completo", "dibattito", "sintesi", "univoca", "cross",
-                       "correggi", "salva", "svuota", "cartella", "add", "opzioni"):
-            self.bottoni[chiave].configure(text=t[chiave])
+                       "correggi", "salva", "svuota", "cartella", "add", "opzioni",
+                       "agenti"):
+            if chiave == "svuota" and getattr(self, "_interrompi_attivo", False):
+                continue  # A12: durante l'elaborazione resta "Interrompi"
+            self.bottoni[chiave].configure(
+                text=t.get(chiave, TESTI["en"].get(chiave, chiave)))
+        # B2g rev.: pulsante compatto in status bar (lingua attiva)
+        try:
+            self._btn_pul_status.configure(text=t["pul_pulsante_breve"])
+        except (tk.TclError, AttributeError):
+            pass
         self.c_finale.descrizione(t["descr_finale"])
         # headers tradotti (nessuna cancellazione: il contenuto delle colonne si conserva)
         for c, nome in ((self.c_a, t["llm1"]), (self.c_b, t["llm2"]),
                         (self.c_c, t["llm3"]), (self.c_finale, t["finale"])):
             self._lbl_polo[c].configure(text=f"  {nome}  ")
-        for box in (self.c_a.box, self.c_b.box, self.c_c.box, self.c_finale.box):
-            box.configure(state="disabled")
         if self._e_placeholder():
             self._metti_placeholder()
         else:
@@ -1526,7 +2853,10 @@ class TrilogoApp(Finestra):
             self._metti_placeholder()
 
     def _invio_supervisore(self, e=None):
-        """<Return> invia la domanda; <Shift+Return> lascia il newline di default."""
+        """<Return> invia la domanda; <Shift+Return> inserisce il newline.
+        F4-E: <Return> matcha anche Shift+Return in Tk -> check del modificatore."""
+        if e is not None and (e.state & 0x1):  # Shift premuto: newline di default
+            return None
         self._completo()
         return "break"
 
@@ -1549,7 +2879,10 @@ class TrilogoApp(Finestra):
 
     def _supervisore_appendi(self, testo):
         """Appende una riga allo storico del supervisore (una domanda per riga).
-        L'input corrente (testo NON marcato ▶) viene convertito in riga ▶: niente duplicati."""
+        F4-E: il nuovo messaggio va SEMPRE su una riga propria (separatore \n
+        prima e riga libera dopo), così la nuova domanda digitata è riconosciuta
+        da _testo_supervisore; l'input corrente non marcato viene convertito in
+        riga ▶ (niente duplicati)."""
         testo_campo = self.supervisore.get("1.0", "end").strip()
         if self._e_placeholder():
             self.supervisore.delete("1.0", "end")
@@ -1564,7 +2897,10 @@ class TrilogoApp(Finestra):
                 self.supervisore.insert("1.0", "\n".join(righe[:ultimo + 1]))
             else:
                 self.supervisore.delete("1.0", "end")
-        self.supervisore.insert("end", testo)
+        contenuto = self.supervisore.get("1.0", "end-1c")
+        if contenuto and not contenuto.endswith("\n"):
+            self.supervisore.insert("end", "\n")
+        self.supervisore.insert("end", testo + "\n")
         self.supervisore.see("end")
 
     def _lenti_attivi(self):
@@ -1591,6 +2927,7 @@ class TrilogoApp(Finestra):
             self.c_finale.scrivi(TESTI[self.lingua]["chiedi_prima"])
             self.stato("Scrivi prima una domanda nella barra in alto")
             return
+        self._garanzia_motore()  # B2f: fallback ai client esterni se serve
         if not self._inizia_lavoro():
             self.stato("elaborazione in corso: attendi o premi Esc")
             return
@@ -1604,6 +2941,10 @@ class TrilogoApp(Finestra):
             self.stato(f"⚠ modello lento su CPU: attesa stimata 2-5 min per risposta ({nomi})")
         self._ultima_domanda = domanda
         self._supervisore_appendi("▶ " + " ".join(domanda.split()))
+        if getattr(self, "_profilo_attivo", "") == "Ricerca":
+            # B1e: percorso Ricerca (pianificazione agenti -> esecuzione -> discernimento)
+            threading.Thread(target=self._l_ricerca, args=(domanda,), daemon=True).start()
+            return
         threading.Thread(target=self._l_completo, args=(domanda,), daemon=True).start()
 
     def _aggiorna(self, testo, colore=None):
@@ -1665,66 +3006,21 @@ class TrilogoApp(Finestra):
         except tk.TclError:
             pass
 
-    def _componi_pill(self, passo=None, durata=None, totale=None):
-        """Testo del pill SUPERVISORE: il cronometro è SEMPRE visibile. La stringa
-        completa viene accorciata (passo troncato, poi solo durata+totale) se non
-        entra nella larghezza reale della barra A (misura font vs canvas)."""
-        titolo = getattr(self, "_titolo_supervisore", "SUPERVISORE")
-        if passo is None:
-            return f"  {titolo}  ·  ⏱ 0.0s · in attesa"
-        if durata is None:
-            return f"  {titolo}  ·  ⏱ {passo}"
-        pieno = f"  {titolo}  ·  ⏱ {passo} · passo {durata:.1f}s · totale {totale:.1f}s"
-        breve = f"  {titolo}  ·  ⏱ {passo[:12].rstrip()}… · passo {durata:.1f}s · tot {totale:.1f}s"
-        minimo = f"  {titolo}  ·  ⏱ passo {durata:.1f}s · tot {totale:.1f}s"
-        for cand in (pieno, breve, minimo):
-            if self._pill_ci_sta(cand):
-                return cand
-        return minimo
-
-    def _pill_ci_sta(self, testo):
-        """True se il testo entra nel canvas del pill (barra A full-width, margine
-        per i bordi arrotondati); finestra non ancora materializzata -> True."""
-        try:
-            lar = self.lbl_supervisore.winfo_width()
-            if lar < 10:
-                lar = self._zona_a.frame.winfo_width()
-            if lar < 10:
-                return True
-            return self.lbl_supervisore._font.measure(testo) <= lar - 32
-        except tk.TclError:
-            return True
-
     def _reset_cronometro(self):
-        """Cronometro a riposo nel pill ('⏱ 0.0s · in attesa'): avvio dell'app e
-        cambio lingua (l'etichetta SUPERVISORE resta, il tempo si ripristina)."""
+        """Cronometro a riposo ('⏱ 0.0s · in attesa'): avvio dell'app e cambio
+        lingua. Il testo vive nella status bar composta (F5-A)."""
         self._crono = {"passo": None, "durata": None, "totale": None}
-        self.lbl_supervisore.configure(text=self._componi_pill())
+        self._aggiorna_status()
 
     def _disegna_cronometro(self):
-        """Scrive nel pill l'ultimo stato del cronometro. La composizione del testo
-        (misura font, troncamento) gira SUL MAIN THREAD: tk non è thread-safe e
-        winfo_width/measure dal worker sollevano RuntimeError (main loop)."""
-        c = self._crono
-
-        def _aggiorna():
-            testo = self._componi_pill(c["passo"], c["durata"], c["totale"])
-            self.lbl_supervisore.configure(text=testo)
-
-        self._ui(_aggiorna)
-
-    def _riadatta_pill(self, e=None):
-        """Resize della barra A: ricalcola il testo del pill (troncamento a misura)."""
-        try:
-            if getattr(self, "_crono", None) is not None:
-                self._disegna_cronometro()
-        except tk.TclError:
-            pass
+        """Aggiorna la status bar con l'ultimo stato del cronometro. La scrittura
+        gira SUL MAIN THREAD: tk non è thread-safe (via _ui dai worker)."""
+        self._ui(self._aggiorna_status)
 
     def _tempo(self, passo, durata=None, totale=None):
-        """Cronometro SEMPRE visibile nel rettangolo arancione del pill SUPERVISORE:
-        a riposo '⏱ 0.0s · in attesa'; durante il flusso passo/durata/totale;
-        a fine flusso il totale finale resta visibile (nessun reset qui)."""
+        """Cronometro SEMPRE visibile nella status bar: a riposo '⏱ 0.0s · in
+        attesa'; durante il flusso passo/durata/totale; a fine flusso il totale
+        finale resta visibile (nessun reset qui)."""
         self._crono = {"passo": passo, "durata": durata, "totale": totale}
         self._disegna_cronometro()
 
@@ -1737,9 +3033,76 @@ class TrilogoApp(Finestra):
         except tk.TclError:
             pass
 
+    # ---- V6: warmup modelli (preload in background) ----
+    def _avvia_warmup(self):
+        """V6: preload in background dei soli modelli lenti selezionati, al
+        massimo UNO grande alla volta (regola ARCA: se c'è un 14B, prima lui).
+        Gli altri lenti restano on-demand (nota in status). Non blocca la UI:
+        il caricamento gira in un thread daemon; l'esito torna via coda UI."""
+        if self._chiusa:
+            return
+        if self._warmup_thread is not None and self._warmup_thread.is_alive():
+            return  # un warmup è già in corso: mai due caricamenti insieme
+        candidati = []
+        for polo, modello in (("A", self.canale.A), ("B", self.canale.B),
+                              ("C", getattr(self.canale, "C", None))):
+            if modello is None:
+                continue
+            if isinstance(modello, _motore.ModelloMotore):
+                # B2f: anche i modelli del motore lenti si scaldano (avvio server)
+                breve = os.path.basename(modello.percorso)[:-5]
+                if not _modello_lento(breve) or breve in self._warmup:
+                    continue
+                candidati.append((polo, modello, breve))
+                continue
+            nome = modello.nome()
+            if not nome.startswith("Ollama:"):
+                continue  # i modelli cloud non si scaldano
+            breve = nome.split(":", 1)[1]
+            if not _modello_lento(breve) or breve in self._warmup:
+                continue
+            candidati.append((polo, modello, breve))
+        if not candidati:
+            return
+        grandi = [c for c in candidati if _modello_grande(c[2])]
+        polo, modello, breve = grandi[0] if grandi else candidati[0]
+        altri = [b for _, _, b in candidati if b != breve]
+        self._warmup[breve] = "in_corso"
+        msg = f"⏳ caricamento {polo} ({breve})…"
+        if altri:
+            msg += f" · {', '.join(altri)} on-demand"
+        self.stato(msg)
+        self._warmup_thread = threading.Thread(
+            target=self._l_warmup, args=(modello, polo, breve), daemon=True)
+        self._warmup_thread.start()
+
+    def _l_warmup(self, modello, polo, breve):
+        """Thread del warmup (V6): precarica il modello e riporta l'esito in
+        status bar sul main thread (via coda UI). Errori -> "fallito", mai crash."""
+        try:
+            dt = modello.precarica()
+            if dt is None:
+                self._warmup.pop(breve, None)
+                return
+            self._warmup[breve] = "pronto"
+            self._ui(self.stato, f"{polo} pronto ({dt:.1f} s)")
+        except Exception:
+            self._warmup[breve] = "fallito"
+            self._ui(self.stato, f"⚠ {polo} ({breve}): caricamento fallito")
+
+    def _attendi_warmup(self):
+        """V6: se un warmup è in corso, il flusso attende che finisca (stesso
+        load, nessuna richiesta duplicata). Chiamata dal thread del flusso."""
+        t = self._warmup_thread
+        if t is not None and t.is_alive():
+            self._ui(self.stato, "⏳ attendo il caricamento del modello…")
+            t.join()
+
     def _l_completo(self, domanda):
         t = TESTI[self.lingua]
         try:
+            # V6: mai due caricamenti insieme — se il warmup è in corso, attende.
+            self._attendi_warmup()
             t0 = time.time()
             t_passo = t0
             def _passo(nome, finito=False):
@@ -1781,12 +3144,134 @@ class TrilogoApp(Finestra):
             _passo("cross-check")
             self._esegui_cross(contesto)
             _passo("cross-check", finito=True)
+            # V2: avviso visibile se qualche risposta è stata troncata dal cap token
+            if getattr(self.canale, "troncamenti", 0):
+                self._ui(self.stato,
+                         f"⚠ {self.canale.troncamenti} risposta/e troncata/e dal limite token")
             self._ui(self.bell)
             _salva_flag_primo_flusso()
         except Exception as e:
             self._ui(self._scrivi_errore, e)
         finally:
             self._ui(self._fine_lavoro)
+
+    # ---- B1e/B3: percorso Ricerca e pannello agenti ----
+    def _contesto_allegati(self):
+        """B1e: contesto testuale dagli allegati del canale (per gli agenti)."""
+        parti = []
+        for a in getattr(self.canale, "allegati", []):
+            if a.get("tipo") == "testo":
+                parti.append(f"[ALLEGATO: {a.get('nome', '?')}]\n"
+                             f"{a.get('contenuto', '')[:4000]}")
+            else:
+                parti.append(f"[ALLEGATO: {a.get('nome', '?')}] (immagine)")
+        return "\n\n---\n\n".join(parti)[:12000]
+
+    def _evento_ricerca(self, tipo, dati):
+        """B1e: eventi della ricerca verso il pannello agenti (main thread)."""
+        try:
+            fin = getattr(self, "_agenti_fin", None)
+            if fin is not None and fin.winfo_exists():
+                fin.evento(tipo, dati)
+        except tk.TclError:
+            pass
+        if tipo == "fase" and dati.get("nome"):
+            self.stato(f"🔎 {dati['nome']}…")
+
+    def _l_ricerca(self, domanda):
+        """B1e: percorso Ricerca in worker: pianifica -> esegui -> discerni ->
+        cross-check -> salvataggio nel perimetro (A9 rev. 5)."""
+        from core import agenti as _agenti
+        try:
+            self._attendi_warmup()
+            # D3 (collaudo F4): nuova ricerca -> zona C pulita
+            self._ui(self.c_finale.box.delete, "1.0", "end")
+            # B3 rev. (N47): il pannello agenti si apre da solo all'avvio della
+            # ricerca e il messaggio guida sparisce (serve solo a riposo).
+            self._ui(self._apri_agenti)
+            self._ui(self._pulisci_agenti)
+            cfg = CONFIG.get("ricerca") or {}
+            self.canale.max_chiamate = int(cfg.get("max_chiamate", 200))
+            evento = lambda tipo, dati: self._ui(self._evento_ricerca, tipo, dati)
+            self._ui(self.stato, "🔎 pianificazione agenti…")
+            piano = _agenti.pianifica(self.canale, domanda,
+                                      contesto=self._contesto_allegati(),
+                                      cfg=cfg, evento=evento)
+            if piano is None:
+                self._ui(self.c_finale.scrivi,
+                         "Ricerca: il piano agenti non è stato prodotto in formato "
+                         "valido (riprova o usa un modello più grande per il piano).")
+                return
+            self._ui(self.c_a.scrivi, "[PIANO AGENTI]\n" + "\n".join(
+                f"- {a['nome']} ({a['specialita']}): {a['obiettivo']}"
+                for a in piano.agenti))
+            self._ui(self.stato, f"🔎 esecuzione di {len(piano.agenti)} agenti…")
+            risultati = _agenti.esegui(self.canale, piano, domanda,
+                                       contesto=self._contesto_allegati(),
+                                       cfg=cfg, evento=evento)
+            for r in risultati:
+                self._ui(self.c_b.scrivi, f"[{r['nome']}]\n{r['testo']}\n")
+            self._ui(self.stato, "🔎 discernimento…")
+            esito = _agenti.discerni(self.canale, domanda, piano, risultati,
+                                     cfg=cfg, evento=evento)
+            self.ultimo_finale = esito.risposta
+            self._ui(self.c_finale.scrivi, esito.risposta)
+            self._ui(self.stato, "🔎 cross-check…")
+            self.dibattito_risultato = {"convergito": True}
+            self._esegui_cross({"domanda": domanda})
+            self._ui(self.c_finale.scrivi, self._riga_confidenza(esito, cfg))
+            percorso = _agenti.salva_output(esito, evento=evento)
+            if percorso:
+                msg = f"risultato salvato: {os.path.basename(percorso)}"
+            else:
+                msg = ("risultato in GUI (per salvarlo scegli la cartella "
+                       "progetto con 📁 Progetto)")
+            # P4-2 (collaudo F4): mostrato DOPO la coda del cross-check, senza
+            # essere sovrascritto da "cross-check completato".
+            self._ui(lambda m=msg: self.after(600, lambda: self.stato(m)))
+            self._ui(self.bell)
+            _salva_flag_primo_flusso()
+        except Exception as e:
+            self._ui(self._scrivi_errore, e)
+        finally:
+            self._ui(self._fine_lavoro)
+
+    def _riga_confidenza(self, esito, cfg):
+        """B3: riga [CONFIDENZA: …] in formato italiano (virgola decimale)."""
+        soglia = float((cfg or {}).get("soglia_ottimo", 8.99))
+        n = len(esito.iterazioni) if esito.iterazioni else 0
+        punteggio = f"{esito.punteggio_finale:.2f}".replace(".", ",")
+        soglia_s = f"{soglia:.2f}".replace(".", ",")
+        return (f"[CONFIDENZA: {punteggio}/10 · soglia {soglia_s} · iterazione {n}"
+                f" · stop: {esito.motivo_stop}]")
+
+    def _apri_agenti(self):
+        """B3: apre il pannello 'Squadra di ricerca' (avvisa se il profilo non è Ricerca)."""
+        try:
+            fin = getattr(self, "_agenti_fin", None)
+            if fin is not None and fin.winfo_exists():
+                fin.lift()
+                return
+        except tk.TclError:
+            pass
+        self._agenti_fin = FinestraAgenti(self)
+        try:
+            self._agenti_fin.lift()
+        except tk.TclError:
+            pass
+        if getattr(self, "_profilo_attivo", "") != "Ricerca":
+            self._agenti_fin.evento("avviso", {
+                "testo": "Attiva il profilo Ricerca per usare la squadra di agenti."})
+
+    def _pulisci_agenti(self):
+        """B3 rev. (N47): all'avvio di una ricerca il pannello si azzera
+        (il messaggio guida 'Nessuna ricerca in corso' sparisce)."""
+        fin = getattr(self, "_agenti_fin", None)
+        try:
+            if fin is not None and fin.winfo_exists():
+                fin.pulisci()
+        except tk.TclError:
+            pass
 
     def _opzioni_c(self, fn):
         """kwargs extra per la terza voce C: on_chunk_c in streaming verso c_c.
@@ -1810,14 +3295,14 @@ class TrilogoApp(Finestra):
 
     def _flusso(self, colonna, pezzo):
         """Scrittura incrementale (streaming) nella colonna, senza bloccare la GUI.
-        Le operazioni tkinter girano SOLO sul main thread (via _ui)."""
+        Le operazioni tkinter girano SOLO sul main thread (via _ui). Nessun toggle
+        di state: i box di output sono in sola lettura selezionabile permanente,
+        così la selezione dell'utente non viene cancellata durante lo streaming."""
         if threading.current_thread() is not threading.main_thread():
             self._ui(self._flusso, colonna, pezzo)
             return
-        colonna.box.configure(state="normal")
         colonna.box.insert("end", pezzo)
         colonna.box.see("end")
-        colonna.box.configure(state="disabled")
 
     def _cross_check(self):
         if not self._inizia_lavoro():
@@ -1840,8 +3325,15 @@ class TrilogoApp(Finestra):
                 return
             self._ui(self.c_finale.scrivi, "\n[🛡 CROSS-CHECK in corso …]")
             risultato = self.canale.cross_check(contesto, finale)
-            self._ui(self.c_finale.scrivi, self._riga_verdetto(risultato) + "\n" + risultato["testo"])
-            self.ultimo_finale = finale
+            self._ui(self.c_finale.scrivi,
+                     self._riga_verdetto(risultato, self._non_convergente()) + "\n" + risultato["testo"])
+            # A11.2: la VERSIONE PULITA di C sostituisce la risposta finale se CONFERMATA
+            versione_pulita = risultato.get("versione_pulita") or ""
+            if risultato["verdetto"] == "CONFERMATA" and versione_pulita:
+                self.ultimo_finale = versione_pulita
+                self._ui(self.c_finale.scrivi, "[RISPOSTA FINALE PULITA]\n" + versione_pulita)
+            else:
+                self.ultimo_finale = finale
             self.ultimo_punti = risultato["testo"]
             self.ultimo_verdetto = risultato["verdetto"]
             self._messaggio_finale = "cross-check completato"
@@ -1849,11 +3341,20 @@ class TrilogoApp(Finestra):
         except Exception as e:
             self._ui(self._scrivi_errore, e)
 
-    def _riga_verdetto(self, risultato):
-        """Riga [VERDETTO: … · metriche] in formato unico (cross-check e Correggi)."""
+    def _riga_verdetto(self, risultato, non_convergente=False):
+        """Riga [VERDETTO: … · metriche · pulizia · nota] in formato unico
+        (A11 rev. 8): la nota 'non convergente' compare solo se il dibattito non
+        è convergito, MAI nel corpo della risposta."""
         met = risultato["metriche"]
+        nota = " | nota: non convergente" if non_convergente else ""
         return (f"[VERDETTO: {risultato['verdetto']} · supportate {met['affermazioni_supportate']} "
-                f"| non supportate {met['affermazioni_non_supportate']} | parole {met['parole_risposta']}]")
+                f"| non supportate {met['affermazioni_non_supportate']} | parole {met['parole_risposta']} "
+                f"| pulizia: {met.get('pulizia', '?')}{nota}]")
+
+    def _non_convergente(self):
+        """True se l'ultimo dibattito registrato non è convergito (A11 rev. 8)."""
+        d = self.dibattito_risultato
+        return isinstance(d, dict) and not d.get("convergito", True)
 
     def _l_cross(self):
         t = TESTI[self.lingua]
@@ -1934,6 +3435,10 @@ class TrilogoApp(Finestra):
             self._ui(self._fine_lavoro)
 
     def _salva(self):
+        """💾 Salva: sessione in sessioni/ (proprietà dell'app, come oggi) e, se
+        la cartella progetto è scelta, il RISULTATO in <cartella progetto>/TRILogos_output/
+        (A9c, nome univoco: mai overwrite). Senza cartella: avviso informativo,
+        nessun blocco della lettura/dialogo (rev. 5)."""
         try:
             j, md = self.canale.salva()
             nome = os.path.splitext(os.path.basename(j))[0]
@@ -1943,16 +3448,48 @@ class TrilogoApp(Finestra):
             if c_terzo is not None:
                 modelli.append(c_terzo.nome())
             tid = aggiungi_sessione(nome, domanda, modelli, self.lingua, j, md,
-                                    verdetto=getattr(self, "ultimo_verdetto", "") or "non verificata")
-            self.stato(f"salvata: {md} · timeline evento {tid}")
+                                    verdetto=getattr(self, "ultimo_verdetto", "") or "non verificata",
+                                    autore=_autore_timeline())
+            messaggio = f"salvata: {md} · timeline evento {tid}"
+            if perimetro.leggi() is None:
+                from tkinter import messagebox
+                messagebox.showinfo(
+                    "TRILogos — salva risultato",
+                    "Per salvare il risultato scegli la cartella progetto (📁 Progetto).\n"
+                    "La sessione è stata salvata in sessioni/.",
+                    parent=self)
+            else:
+                percorso = self._salva_risultato(domanda, modelli)
+                if percorso:
+                    messaggio += f" · risultato: {os.path.basename(percorso)}"
+            self.stato(messaggio)
         except Exception as e:
             self.c_finale.scrivi(f"ERRORE salvataggio: {e}")
 
+    def _salva_risultato(self, domanda, modelli):
+        """A9c: salva la risposta univoca in <cartella progetto>/TRILogos_output/
+        con nome univoco (mai overwrite: _2, _3, …). Ritorna il percorso scritto,
+        o None se non c'è un risultato da salvare."""
+        finale = getattr(self, "ultimo_finale", "") or ""
+        if not finale:
+            return None
+        out_dir = perimetro.risolvi("TRILogos_output")
+        os.makedirs(out_dir, exist_ok=True)
+        percorso = perimetro.nome_univoco("TRILogos_output", "risultato.md")
+        verdetto = getattr(self, "ultimo_verdetto", "") or "non verificata"
+        with open(percorso, "x", encoding="utf-8") as f:
+            f.write("# TRILogos — risultato\n\n")
+            f.write(f"- Data: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"- Domanda: {domanda}\n")
+            f.write(f"- Modelli: {', '.join(modelli)}\n")
+            f.write(f"- Verdetto: {verdetto}\n\n")
+            f.write("## Risposta univoca\n\n")
+            f.write(finale.rstrip() + "\n")
+        return percorso
+
     def _svuota(self):
         for c in (self.c_a, self.c_b, self.c_c, self.c_finale):
-            c.box.configure(state="normal")
             c.box.delete("1.0", "end")
-            c.box.configure(state="disabled")
         self._metti_placeholder()
         self.canale.allegati = []
         self.canale.cronologia = []
@@ -1963,16 +3500,44 @@ class TrilogoApp(Finestra):
         self.ultimo_punti = ""
         self._rigiri = 0
         self.dibattito_risultato = None
+        # P4-5 (collaudo F4): svuota anche il pannello Squadra di ricerca
+        try:
+            fin = getattr(self, "_agenti_fin", None)
+            if fin is not None and fin.winfo_exists():
+                fin.pulisci()
+        except tk.TclError:
+            pass
+        self._reset_cronometro()  # F4-E: Svuota/cambio modello azzerano il cronometro
 
     def _voce_canale(self, modello):
-        """Ritrova la voce del menu corrispondente al modello attivo del canale."""
+        """Ritrova la voce del menu corrispondente al modello attivo del canale.
+        Se il modello è noto (Ollama/OpenAI/Anthropic) ma la sua voce NON è nei
+        menu (es. server spento), restituisce comunque la voce composta: la combo
+        mostra ciò che il canale usa davvero (WYSIWYG). Il fallback 'mock'/prima
+        voce resta SOLO per i modelli ignoti (es. Mock)."""
         nome = modello.nome()
+        # P2-A (collaudo B2rev): le voci del motore interno ("<nome> (motore)")
+        # non devono cadere nel fallback alla prima voce (che può essere un
+        # modello Ollama "(lento)"): match per percorso del modello.
+        if isinstance(modello, _motore.ModelloMotore):
+            for v in self.opzioni:
+                try:
+                    if (_motore.e_voce_motore(v)
+                            and _motore.percorso_da_voce(v) == modello.percorso):
+                        return v
+                except Exception:
+                    continue
         for tipo, suffisso in (("Ollama:", "ollama"), ("OpenAI:", "openai"), ("Anthropic:", "anthropic")):
             if nome.startswith(tipo):
                 m = nome.split(":", 1)[1]
                 for v in self.opzioni:
-                    if v.replace(_SUFFISSO_LENTO, "") == f"{m} · {suffisso}":
-                        return v
+                    # F4-E: il suffisso di lentezza va spogliato dal solo NOME
+                    # (parte prima di " · "), non dall'intera voce.
+                    if " · " in v:
+                        nome_v, client_v = v.rsplit(" · ", 1)
+                        if client_v == suffisso and _spoglia_suffisso(nome_v) == m:
+                            return v
+                return f"{m} · {suffisso}"
         if nome.startswith("Mock"):
             return "mock"
         for v in self.opzioni:
@@ -1981,48 +3546,77 @@ class TrilogoApp(Finestra):
         return self.opzioni[0] if self.opzioni else "mock"
 
     def _add_cartella(self):
-        """Seleziona una cartella intera: carica tutti i file supportati (max 40)."""
+        """📁 Progetto: sceglie la cartella progetto (perimetro esclusivo, A9) e
+        carica i file supportati (max 40, cap totale del core)."""
         from tkinter import filedialog
-        cartella = filedialog.askdirectory(title="Cartella — carica tutti i documenti/immagini")
+        cartella = filedialog.askdirectory(title="Cartella progetto — carica tutti i documenti/immagini")
         if not cartella:
             return
+        try:
+            radice = perimetro.imposta(cartella)
+        except ValueError as e:
+            self.stato(f"cartella progetto non valida: {e}")
+            return
+        self._aggiorna_perimetro_ui()
         supportati = [".txt", ".md", ".csv", ".py", ".json", ".log", ".tex", ".html",
                       ".yml", ".yaml", ".ini", ".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"]
         file_trovati = []
-        for radice, _, nomi in os.walk(cartella):
+        for radice_cartella, _, nomi in os.walk(radice):
             for n in nomi:
                 if os.path.splitext(n)[1].lower() in supportati:
-                    file_trovati.append(os.path.join(radice, n))
+                    file_trovati.append(os.path.join(radice_cartella, n))
             if len(file_trovati) >= 40:
                 break
         file_trovati = file_trovati[:40]
         if not file_trovati:
-            self._supervisore_appendi("[cartella] nessun file supportato trovato")
+            self._supervisore_appendi("[progetto] nessun file supportato trovato")
+            self.stato(f"progetto: {perimetro.nome()} · nessun file supportato")
             return
         esiti = self.canale.aggiungi_file(file_trovati)
         for e in esiti:
-            self._supervisore_appendi(f"[cartella] {e}")
-        self.stato(f"cartella caricata ({len(esiti)} file)")
+            self._supervisore_appendi(f"[progetto] {e}")
+        self.stato(f"progetto: {perimetro.nome()} · caricati {len(esiti)} file")
 
     def _add_files(self):
-        """Selezione file (testo, PDF, immagini) da dare in pasto al canale."""
-        from tkinter import filedialog
+        """➕ ADD (rev. 5): le LETTURE sono libere — il pulsante funziona anche
+        senza cartella progetto (caso d'uso: far leggere i file per un sunto).
+        Se il perimetro è scelto, i file fuori perimetro sono ignorati con avviso;
+        il cap di 40 allegati è sempre segnalato. Nessun blocco preventivo."""
+        from tkinter import filedialog, messagebox
         percorsi = filedialog.askopenfilenames(
             title="ADD — seleziona documenti o immagini",
             filetypes=[("Documenti e immagini", "*.txt *.md *.csv *.py *.json *.log *.tex *.html *.pdf *.png *.jpg *.jpeg *.webp *.gif"),
                        ("Tutti i file", "*.*")])
         if not percorsi:
             return
-        esiti = self.canale.aggiungi_file(list(percorsi))
+        if perimetro.leggi() is None:
+            dentro, fuori = list(percorsi), []  # letture libere: nessun vincolo
+        else:
+            dentro = [p for p in percorsi if perimetro.dentro(p)]
+            fuori = [p for p in percorsi if p not in dentro]
+        esiti = self.canale.aggiungi_file(dentro) if dentro else []
+        rifiutati = [e for e in esiti if "cap di" in e]
         for e in esiti:
             self._supervisore_appendi(f"[allegato] {e}")
-        self.stato(f"{len(esiti)} allegato/i aggiunto/i al canale")
+        avvisi = []
+        if fuori:
+            avvisi.append("Ignorati (fuori dalla cartella progetto):\n" +
+                          "\n".join(f"• {os.path.basename(p)}" for p in fuori))
+        if rifiutati:
+            avvisi.append("Non aggiunti (cap di 40 allegati raggiunto):\n" +
+                          "\n".join(f"• {r}" for r in rifiutati))
+        if avvisi:
+            messagebox.showwarning("TRILogos — allegati", "\n\n".join(avvisi), parent=self)
+        if esiti:
+            self.stato(f"{len(esiti)} allegato/i aggiunto/i al canale")
+        else:
+            self.stato("Nessun file aggiunto al canale")
 
     def _opzioni(self):
         """Finestra Opzioni: gestione completa dei clienti (aggiungi, modifica modelli, elimina, preset)."""
         fin = tk.Toplevel(self)
         fin.title("TRILogos — Opzioni / Clienti")
-        fin.geometry("620x520")
+        fin.geometry("720x560")
         fin.configure(bg=PALETTE["sfondo"])
         fin.transient(self)
 
@@ -2039,15 +3633,15 @@ class TrilogoApp(Finestra):
         sel_bar.pack(fill="x", padx=8)
         ttk.Label(sel_bar, text="Cliente selezionato:").pack(side="left")
         combo_clienti = ComboRotonda(sel_bar, values=[c["nome"] for c in self.clienti],
-                                     width=24, bg=PALETTE["sfondo"])
+                                     width=18, bg=PALETTE["sfondo"])
         if self.clienti:
             combo_clienti.current(0)
         combo_clienti.pack(side="left", padx=4)
-        e_modello_nuovo = ttk.Entry(sel_bar, width=20)
+        e_modello_nuovo = ttk.Entry(sel_bar, width=14)
         e_modello_nuovo.pack(side="left", padx=4)
-        PulsanteRotondo(sel_bar, testo="＋ Modello", width=10,
+        PulsanteRotondo(sel_bar, testo="＋ Modello", width=11,
                    comando=lambda: self._op_aggiungi_modello(fin, combo_clienti, e_modello_nuovo, lista)).pack(side="left", padx=2)
-        PulsanteRotondo(sel_bar, testo="🗑 Elimina", width=9,
+        PulsanteRotondo(sel_bar, testo="🗑 Elimina", width=11,
                    comando=lambda: self._op_elimina_client(fin, combo_clienti, lista)).pack(side="left", padx=2)
 
         form = ttk.Frame(fin)
@@ -2096,8 +3690,12 @@ class TrilogoApp(Finestra):
         PulsanteRotondo(fin, testo="⚡ Ollama",
                     comando=lambda: self._op_preset(fin, lista, combo_clienti,
                     "ollama", "http://localhost:11434/v1", "", [])).pack(side="left", padx=2)
+        PulsanteRotondo(fin, testo=TESTI[self.lingua]["motore_apri"],
+                    comando=self._apri_avvio_guidato).pack(side="left", padx=8, pady=8)
+        PulsanteRotondo(fin, testo=TESTI[self.lingua]["pul_pulsante"],
+                    comando=self._apri_pulizia_hw).pack(side="left", padx=2, pady=8)
         PulsanteRotondo(fin, testo="✖ Chiudi", comando=fin.destroy).pack(side="right", padx=8, pady=8)
-        PulsanteRotondo(fin, testo="🔑 API Key", width=9,
+        PulsanteRotondo(fin, testo="🔑 API Key", width=12,
                     comando=lambda: self._op_istruzioni_chiavi(fin)).pack(side="right", padx=2, pady=8)
         ttk.Label(fin, text="I modelli dei client compaiono nei menu di LLM1, LLM2 e LLM3. Le chiavi: solo nomi di variabili d'ambiente.",
                   background=PALETTE["sfondo"], foreground=PALETTE["secondario"]).pack(side="bottom", pady=4)
@@ -2111,20 +3709,40 @@ class TrilogoApp(Finestra):
         lista.configure(state="disabled")
 
     def _ricarica_clienti(self, lista, combo_clienti):
-        self._aggiorna_menu_clienti()
-        combo_clienti.configure(values=[c["nome"] for c in self.clienti])
-        if self.clienti:
-            combo_clienti.current(0)
-        self._aggiorna_lista_clienti(lista)
+        """Ricarica i clienti in BACKGROUND (F4-E): il probe di rete non blocca
+        più la UI (prima ~5 s con i server spenti). A fine corsa aggiorna menu,
+        combo e lista della finestra Opzioni (se ancora aperta)."""
+        def _lavoro():
+            try:
+                clienti = rileva_clienti()
+            except Exception:
+                return
+            self._ui(self._applica_ricarica_opzioni, clienti, lista, combo_clienti)
+        threading.Thread(target=_lavoro, daemon=True).start()
+
+    def _applica_ricarica_opzioni(self, clienti, lista, combo_clienti):
+        """Aggiorna i menu e la finestra Opzioni (se ancora aperta)."""
+        self._applica_clienti(clienti)
+        try:
+            if not lista.winfo_exists():
+                return
+            combo_clienti.configure(values=[c["nome"] for c in self.clienti])
+            if self.clienti:
+                combo_clienti.current(0)
+            self._aggiorna_lista_clienti(lista)
+        except tk.TclError:
+            pass
 
     def _aggiorna_menu_clienti(self):
-        """Rileva di nuovo i clienti e aggiorna i menu di LLM1/LLM2/LLM3 (dopo
-        l'aggiunta di un client dallo splash o da Opzioni). La selezione
-        corrente resta intatta (solo i values della combo cambiano)."""
-        self.clienti = rileva_clienti()
-        self.opzioni = _opzioni_etichettate(voci_modelli(self.clienti))
-        for combo in (self.c_a.combo, self.c_b.combo, self.c_c.combo):
-            combo.configure(values=self.opzioni)
+        """Rileva i clienti in BACKGROUND (F4-E: niente blocco UI) e aggiorna i
+        menu di LLM1/LLM2/LLM3 (usata dallo splash dopo l'aggiunta di un client)."""
+        def _lavoro():
+            try:
+                clienti = rileva_clienti()
+            except Exception:
+                return
+            self._ui(self._applica_clienti, clienti)
+        threading.Thread(target=_lavoro, daemon=True).start()
 
     def _cambia_modello_terzo(self, voce):
         """LLM3 in fase intermedia (canale senza C): la combo è attiva ma la
@@ -2165,7 +3783,7 @@ class TrilogoApp(Finestra):
                 if revisione:
                     self._ui(self.c_b.scrivi, revisione)
                 self._ui(self.c_c.scrivi, esito_cross["testo"])
-                self._ui(self.c_finale.scrivi, self._riga_verdetto(esito_cross))
+                self._ui(self.c_finale.scrivi, self._riga_verdetto(esito_cross, self._non_convergente()))
                 if self.ultimo_verdetto != "DA_CORREGGERE":
                     break
             if self._rigiri >= 3 and self.ultimo_verdetto == "DA_CORREGGERE":
@@ -2250,25 +3868,33 @@ class TrilogoApp(Finestra):
             colonna.combo.set(self._voce_canale(getattr(self.canale, polo)))
             return
         try:
-            nuovo = modello_da_voce(voce, self.clienti)
+            _timeout = _timeout_rete()[0]
+            _ka = _keep_alive_ollama()
+            _nc = _num_ctx_ollama()
+            nuovo = modello_da_voce(voce, self.clienti, timeout=_timeout, keep_alive=_ka, num_ctx=_nc)
             if polo == "C":
-                a = modello_da_voce(self.c_a.combo.get(), self.clienti)
-                b = modello_da_voce(self.c_b.combo.get(), self.clienti)
+                a = modello_da_voce(self.c_a.combo.get(), self.clienti, timeout=_timeout, keep_alive=_ka, num_ctx=_nc)
+                b = modello_da_voce(self.c_b.combo.get(), self.clienti, timeout=_timeout, keep_alive=_ka, num_ctx=_nc)
                 c = nuovo
             else:
                 altro_polo = "B" if polo == "A" else "A"
                 voce_altro = self.c_b.combo.get() if altro_polo == "B" else self.c_a.combo.get()
-                altro = modello_da_voce(voce_altro, self.clienti)
+                altro = modello_da_voce(voce_altro, self.clienti, timeout=_timeout, keep_alive=_ka, num_ctx=_nc)
                 a = nuovo if polo == "A" else altro
                 b = nuovo if polo == "B" else altro
-                c = modello_da_voce(self.c_c.combo.get(), self.clienti) if SUPPORTA_C else None
+                c = (modello_da_voce(self.c_c.combo.get(), self.clienti, timeout=_timeout, keep_alive=_ka, num_ctx=_nc)
+                     if SUPPORTA_C else None)
             nome_profilo = self.combo_profilo.get() or next(iter(CONFIG["profili"]))
             ruoli = CONFIG["profili"].get(nome_profilo) or next(iter(CONFIG["profili"].values()))
             kwargs = dict(ruolo_a=ruoli["A"], ruolo_b=ruoli["B"],
                           max_turni_dibattito=CONFIG["canale"]["max_turni_dibattito"],
                           soglia_convergenza=CONFIG["canale"]["soglia_convergenza"],
                           max_chiamate=CONFIG["canale"].get("max_chiamate", 40),
-                          lingua=self.lingua)
+                          lingua=self.lingua,
+                          stile=ruoli.get("stile") or "",
+                          formato_risposta=ruoli.get("formato_risposta") or "semplice",
+                          dibattito_parallelo=CONFIG["canale"].get("dibattito_parallelo", True),
+                          limiti_token=CONFIG["canale"].get("limiti_token"))
             if SUPPORTA_C:
                 kwargs[_PARAM_C] = c
                 if "C" in ruoli and _supporta(Canale.__init__, "ruolo_c"):
@@ -2279,6 +3905,8 @@ class TrilogoApp(Finestra):
             self.dibattito_risultato = None
             self._svuota()
             self.stato(f"{polo} → {nuovo.nome()} · canale ricostruito")
+            _motore.ferma_server_non_usati(self.canale)
+            self._avvia_warmup()
         except Exception as e:
             self.stato(f"ERRORE cambio modello: {e}")
 
